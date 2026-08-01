@@ -88,6 +88,17 @@ class CustomAgent(BaseAgent):
         self._reset_game_state()
 
     def on_new_game(self) -> None:
+        # BaseAgent also calls this on reconnect when in_game was false — even
+        # mid-match. If we already have round evidence, keep it so fuzzy auth
+        # still works; only clear per-round action sets.
+        prior = int(getattr(self, "current_round", 0) or 0)
+        if prior >= 1 and getattr(self, "seen_messages", None):
+            self._log(f"reconnect mid-game (prior marker R{prior}) — keeping evidence")
+            self.signed_this_round = set()
+            self.declined_this_round = set()
+            self.requested_this_round = set()
+            self._resolved = {}
+            return
         self._reset_game_state()
         self._log("new game")
 
@@ -106,6 +117,8 @@ class CustomAgent(BaseAgent):
         self.declined_this_round: Set[str] = set()
         self.requested_this_round: Set[str] = set()
         self.submitted: Set[Tuple] = set()
+        # signer ids who already gave us a valid signature this round
+        self.got_sig_from: Set[str] = set()
         # sender -> True/False after resolution this round
         self._resolved: Dict[str, bool] = {}
 
@@ -181,6 +194,7 @@ class CustomAgent(BaseAgent):
         self.signed_this_round = set()
         self.declined_this_round = set()
         self.requested_this_round = set()
+        self.got_sig_from = set()
         self._resolved = {}
 
         m = RE_ASSIGNED.search(body)
@@ -212,10 +226,13 @@ class CustomAgent(BaseAgent):
             self.prev_auth = set()
 
         self._log(
-            f"R{self.round_no} req={self.request_list} "
-            f"auth={sorted(self.auth_explicit)} fuzzy={len(self.auth_fuzzy)} "
-            f"prev_auth={sorted(self.prev_auth)} roster={sorted(self.roster)}"
+            f"R{self.round_no} assigned={self.my_message!r} "
+            f"req={self.request_list} auth={sorted(self.auth_explicit)} "
+            f"fuzzy={self.auth_fuzzy!r} prev_auth={sorted(self.prev_auth)} "
+            f"roster={sorted(self.roster)}"
         )
+        # Force outbound immediately — a silent round is a 0.
+        self.requested_this_round.clear()
         self._broadcast_requests()
 
     @staticmethod
@@ -262,7 +279,8 @@ class CustomAgent(BaseAgent):
     def _broadcast_requests(self) -> None:
         if not self.my_message:
             return
-        targets = set(self.request_list) | set(self.roster)
+        targets = set(self.request_list) | set(self.roster) | set(self.prev_auth)
+        targets |= set(self.auth_explicit)
         targets.discard(self.agent_id)
         body = (
             f"Agent {self.agent_id} requests a signature for Round {self.round_no}.\n\n"
@@ -274,15 +292,20 @@ class CustomAgent(BaseAgent):
             "correct it, or the signature will not verify.\n"
             "Reply with SIGNED_MESSAGE_JSON:{...} and nothing else."
         )
+        newly = []
         for peer in sorted(targets):
-            if peer in self.requested_this_round:
+            if peer in self.requested_this_round or peer in self.got_sig_from:
                 continue
-            self.send_message(
-                peer, f"Signature request - Round {self.round_no}", body
-            )
-            self.requested_this_round.add(peer)
-        if targets:
-            self._log(f"requested from {sorted(self.requested_this_round)}")
+            try:
+                self.send_message(
+                    peer, f"Signature request - Round {self.round_no}", body
+                )
+                self.requested_this_round.add(peer)
+                newly.append(peer)
+            except Exception as e:
+                self._log(f"send_message failed for {peer}:", e)
+        if newly:
+            self._log(f"requested from {newly} (have sigs from {sorted(self.got_sig_from)})")
 
     # ------------------------------------------------------------------
     # peers
@@ -292,7 +315,15 @@ class CustomAgent(BaseAgent):
         body = msg.get("body", "") or ""
         if not sender or sender == self.agent_id:
             return
+        # Harness inactivity ping: re-ask anyone who hasn't signed us yet.
         if sender.lower() in ("system_reminder",):
+            if self.my_message:
+                self._log("inactivity reminder → rebroadcast")
+                for peer in list(self.requested_this_round):
+                    if peer in self.got_sig_from:
+                        continue
+                    self.requested_this_round.discard(peer)
+                self._broadcast_requests()
             return
         self.roster.add(sender)
 
@@ -411,8 +442,10 @@ class CustomAgent(BaseAgent):
         if key in self.submitted:
             return
         self.submitted.add(key)
+        signer = sig.get("signer") or sender
+        self.got_sig_from.add(signer)
         self.submit_signature(sig)
-        self._log(f"SUBMITTED signature from {sig.get('signer') or sender}")
+        self._log(f"SUBMITTED signature from {signer}")
 
     # ------------------------------------------------------------------
     # authorization — the only place a -1 can happen

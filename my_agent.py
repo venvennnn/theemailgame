@@ -59,6 +59,19 @@ RE_ASK = [
     re.compile(r'["\u201c](?P<m>[^"\u201c\u201d]{5,400})["\u201d]'),
 ]
 
+# Peers often volunteer prior-round text to help fuzzy resolution.
+RE_IDENTITY_NOTE = re.compile(
+    r"(?:identity\s+note|in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was)"
+    r"[^=\n]*?(?:round\s+(?P<r2>\d+)[^=\n]*)?"
+    r"""["'](?P<m>[^"']{5,400})["']""",
+    re.IGNORECASE | re.DOTALL,
+)
+RE_IDENTITY_NOTE2 = re.compile(
+    r"in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was\s*[:=]?\s*"
+    r"""["'](?P<m>[^"']{5,400})["']""",
+    re.IGNORECASE,
+)
+
 
 def _clean(s: str) -> str:
     s = (s or "").strip()
@@ -283,6 +296,9 @@ class CustomAgent(BaseAgent):
             return
         self.roster.add(sender)
 
+        # Learn prior-round texts peers volunteer (helps hard fuzzy paraphrases).
+        learned = self._ingest_identity_notes(sender, body)
+
         # 1) Signature for us → submit immediately (also handle ask+sig combo).
         if "SIGNED_MESSAGE_JSON:" in body:
             j = RE_SIGNED_JSON.search(body)
@@ -296,8 +312,15 @@ class CustomAgent(BaseAgent):
 
         self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
 
-        if sender in self.signed_this_round or sender in self.declined_this_round:
+        if sender in self.signed_this_round:
             return
+
+        # If we declined earlier but new identity evidence arrived, retry auth.
+        if sender in self.declined_this_round:
+            if not learned and sender in self._resolved:
+                return
+            self.declined_this_round.discard(sender)
+            self._resolved.pop(sender, None)
 
         if not self._may_sign_for(sender):
             self.declined_this_round.add(sender)
@@ -311,6 +334,7 @@ class CustomAgent(BaseAgent):
             return
 
         self.signed_this_round.add(sender)
+        self.declined_this_round.discard(sender)
         self.sign_and_respond(
             to_agent=sender,
             message_to_sign=wanted,
@@ -319,13 +343,34 @@ class CustomAgent(BaseAgent):
         )
         self._log(f"SIGNED for {sender}")
 
+    def _ingest_identity_notes(self, sender: str, body: str) -> bool:
+        """Store volunteered prior-round messages. Returns True if new evidence."""
+        learned = False
+        for pat in (RE_IDENTITY_NOTE2, RE_IDENTITY_NOTE):
+            for m in pat.finditer(body):
+                rnd = m.groupdict().get("r") or m.groupdict().get("r2")
+                msg = _clean(m.group("m"))
+                if not rnd or not msg or "SIGNED_MESSAGE_JSON" in msg:
+                    continue
+                rnd_i = int(rnd)
+                bucket = self.seen_messages.setdefault(sender, {})
+                if bucket.get(rnd_i) != msg:
+                    bucket[rnd_i] = msg
+                    learned = True
+                    self._log(f"identity note {sender} R{rnd_i}: {msg!r}")
+        return learned
+
     def _extract_ask(self, body: str) -> Optional[str]:
         for pat in RE_ASK:
             m = pat.search(body)
             if not m:
                 continue
             cand = _clean(m.group("m"))
+            # Avoid capturing identity-note lines as the message to sign.
+            if cand.lower().startswith("the old ") and "identity note" in (m.string or "").lower():
+                pass
             if 5 <= len(cand) <= 400 and "SIGNED_MESSAGE_JSON" not in cand:
+                # Prefer BEGIN/END or "sign this message for me" hits over loose quotes.
                 return cand
         return None
 
@@ -404,15 +449,11 @@ class CustomAgent(BaseAgent):
             self._log(f"fuzzy sole-candidate: {sender}")
             return True
 
-        # One fuzzy slot: yes/no on whether THAT alias describes the sender.
-        if len(self.auth_fuzzy) == 1:
-            ok = self._llm_match_one(sender, self.auth_fuzzy[0])
-            self._resolved[sender] = ok
-            return ok
-
-        # Multiple fuzzy slots: resolve the full mapping once, cache all.
-        ok = self._llm_resolve_many(sender, candidates)
-        return ok
+        # Resolve comparatively across all candidates (yes/no on one agent is
+        # too brittle for hard paraphrases like
+        # "invitation left unanswered in the evening" ↔ unused dance floor at dusk).
+        mapped = self._resolve_fuzzy_mapping(candidates)
+        return bool(mapped.get(sender))
 
     def _prev_message(self, agent_id: str) -> Optional[str]:
         by_round = self.seen_messages.get(agent_id) or {}
@@ -426,52 +467,73 @@ class CustomAgent(BaseAgent):
             return None
         return by_round[max(earlier)]
 
-    def _llm_match_one(self, sender: str, description: str) -> bool:
-        msg = self._prev_message(sender)
-        if not msg:
-            self._log(f"no prior message for {sender}; decline")
-            return False
-        prompt = (
-            "A description paraphrases exactly one agent's prior message using "
-            "synonyms (not the original words).\n\n"
-            f"Description:\n{description}\n\n"
-            f"Agent {sender}'s prior message:\n{msg}\n\n"
-            "Does the description refer to this agent/message? "
-            'Reply JSON only: {"match": true} or {"match": false}'
-        )
-        data = self._ask_llm_json(prompt)
-        if not isinstance(data, dict):
-            return False
-        return bool(data.get("match")) is True
-
-    def _llm_resolve_many(self, sender: str, candidates: List[str]) -> bool:
+    def _evidence_lines(self, candidates: List[str]) -> List[str]:
         lines = []
         for c in candidates:
-            msg = self._prev_message(c)
-            if msg:
-                lines.append(f"- {c}: {msg}")
-        if not lines:
-            self._resolved[sender] = False
-            return False
+            by_round = self.seen_messages.get(c) or {}
+            if not by_round:
+                continue
+            # Include all prior-round texts we know (R1+R2 help R3 aliases).
+            parts = []
+            for rnd in sorted(r for r in by_round if r < self.round_no):
+                parts.append(f"R{rnd}: {by_round[rnd]}")
+            if parts:
+                lines.append(f"- {c}: " + " | ".join(parts))
+        return lines
 
+    def _resolve_fuzzy_mapping(self, candidates: List[str]) -> Dict[str, bool]:
+        """Map each fuzzy description to at most one candidate; cache on self._resolved."""
+        # If we already fully answered for every candidate, reuse.
+        if candidates and all(c in self._resolved for c in candidates):
+            return self._resolved
+
+        lines = self._evidence_lines(candidates)
+        if not lines:
+            for c in candidates:
+                self._resolved[c] = False
+            return self._resolved
+
+        n = len(self.auth_fuzzy)
         prompt = (
-            "Each description paraphrases exactly one agent's message using "
-            "synonyms rather than the original words.\n\n"
+            "You are resolving fuzzy agent identities in The Email Game.\n"
+            "Each DESCRIPTION is a deliberate synonym paraphrase of exactly one "
+            "agent's PRIOR-round assigned message. Word overlap may be near zero.\n"
+            "Think about meaning: e.g. 'waddling arctic birds'↔penguins; "
+            "'water and nostalgia mixing as the day ends'↔fountain + old radio at dusk; "
+            "'invitation left unanswered in the evening'↔a dance floor no one uses after dusk.\n\n"
+            f"There are {n} description(s). Pick at most one agent id per description. "
+            "Use only ids from the evidence. If unsure for a description, omit it.\n\n"
             "Descriptions:\n"
-            + "\n".join(f"* {a}" for a in self.auth_fuzzy)
-            + "\n\nAgents and their actual prior messages:\n"
+            + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
+            + "\n\nEvidence (agent id → prior messages):\n"
             + "\n".join(lines)
-            + '\n\nWhich agents are described? JSON only: {"agents": ["<id>", ...]}'
+            + '\n\nJSON only: {"matches": [{"description_index": 1, "agent": "<id>"}]}'
         )
         data = self._ask_llm_json(prompt)
-        names = []
+        chosen: Set[str] = set()
         if isinstance(data, dict):
-            names = [n for n in data.get("agents", []) if n in candidates]
+            for item in data.get("matches") or []:
+                if not isinstance(item, dict):
+                    continue
+                agent = item.get("agent")
+                if agent in candidates:
+                    chosen.add(agent)
+
+        # Fallback: if one description and model returned {"agent": "..."} / {"agents":[...]}
+        if not chosen and isinstance(data, dict):
+            if data.get("agent") in candidates:
+                chosen.add(data["agent"])
+            for a in data.get("agents") or []:
+                if a in candidates:
+                    chosen.add(a)
+
         for c in candidates:
-            self._resolved[c] = c in names
-        for c in names:
-            self._log(f"fuzzy LLM mapped -> {c}")
-        return bool(self._resolved.get(sender))
+            self._resolved[c] = c in chosen
+        for c in chosen:
+            self._log(f"fuzzy mapped -> {c}")
+        if not chosen:
+            self._log(f"fuzzy unresolved among {candidates}; declining")
+        return self._resolved
 
     def _ask_llm_json(self, prompt: str) -> Optional[dict]:
         try:

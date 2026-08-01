@@ -1,0 +1,13 @@
+# Secrets - never commit your API key
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local run artifacts
+session_results/
+agent_logs/
+current_game_*.json

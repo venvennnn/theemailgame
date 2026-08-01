@@ -1,0 +1,20 @@
+# Competitor requirements - shipped as requirements.txt by
+# scripts/build_competitor_repo.py.
+#
+# The competitor repo is agent-only: it connects to the host's server and plays.
+# It runs no server of its own, so fastapi, uvicorn, pydantic, httpx, click and
+# trueskill are all host-side only. Every package here is imported by shipped
+# code; every one omitted is another chance for `pip install` to fail on a
+# stranger's laptop on the morning of the competition. Verified by importing
+# every entry point against exactly this list in a clean venv.
+
+requests==2.31.0
+python-dotenv==1.0.1
+cryptography==42.0.8
+PyJWT==2.8.0
+# >=1.55.3: older releases pass 'proxies' to httpx, which httpx 0.28 removed -
+# with httpx unpinned here, a fresh install resolved that pair and every
+# OpenAI client call died with "unexpected keyword argument 'proxies'".
+openai>=1.55.3,<2
+websockets==12.0
+certifi

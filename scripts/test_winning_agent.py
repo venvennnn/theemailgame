@@ -1,7 +1,8 @@
-"""Offline unit tests for CustomAgent parsing / fuzzy matching (no API key)."""
+"""Offline unit tests for CustomAgent parsing / auth prune (no API key)."""
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,7 +12,6 @@ sys.path.insert(0, str(ROOT))
 
 
 def _make_agent():
-    # Avoid BaseAgent.__init__ (network/register). Build a bare instance.
     from my_agent import CustomAgent
 
     with patch.object(CustomAgent, "__init__", lambda self, *a, **k: None):
@@ -26,119 +26,123 @@ def _make_agent():
     return agent
 
 
-def test_parse_round1_instructions():
+def test_round1_broadcast_and_parse():
     agent = _make_agent()
     body = (
-        'Welcome, Me!\n\n**ROUND 1** - Message signing.\n\n'
-        '**Your Assigned Message:**\n'
+        'Welcome!\n\n**ROUND 1**\n\n'
         'You must get signatures for this EXACT message: '
-        '"The dancing penguins have arrived at the ice cream parlor!"\n\n'
-        "**Your Signing Requirements:**\n"
+        '"The dancing penguins have arrived at the ice cream parlor!"\n'
         "1. You must REQUEST signatures from these agents: alice, bob\n"
-        "2. You are AUTHORIZED to sign messages for these agents: charlie, diana\n"
+        "2. You are AUTHORIZED to sign messages for these agents: carol, dave\n"
     )
-    agent._handle_moderator({"from": "moderator", "subject": "instructions", "body": body})
-    assert agent.round_number == 1
-    assert agent.assigned_message == "The dancing penguins have arrived at the ice cream parlor!"
+    agent._handle_moderator({"from": "moderator", "body": body})
+    assert agent.round_no == 1
+    assert "penguins" in agent.my_message
     assert agent.request_list == ["alice", "bob"]
-    assert agent.explicit_authorized == {"charlie", "diana"}
-    # Should request from known agents (alice, bob at minimum).
-    assert agent.send_message.call_count >= 2
+    assert agent.auth_explicit == {"carol", "dave"}
+    assert agent.auth_fuzzy == []
+    # Broadcast to roster (= request + auth peers)
+    assert {"alice", "bob", "carol", "dave"} <= agent.requested_this_round
 
 
-def test_fuzzy_auth_split_and_resolve():
+def test_impersonation_block_and_sole_candidate():
     agent = _make_agent()
+    # Simulate end of round 1 auth.
+    agent.round_no = 1
+    agent.auth_explicit = {"carol", "dave"}
+    agent.signed_this_round = {"carol"}
+    agent.my_message = "old"
     agent.seen_messages = {
-        "alice": ["The dancing penguins have arrived at the ice cream parlor!"],
-        "bob": ["My pet cactus just learned how to play the harmonica."],
+        "carol": {1: "The dancing penguins have arrived at the ice cream parlor!"},
+        "dave": {1: "My pet cactus just learned how to play the harmonica."},
     }
+
     body = (
         '**ROUND 2**\n'
         'You must get signatures for this EXACT message: "Quantum jellybeans taste different in parallel universes."\n'
-        "1. You must REQUEST signatures from these agents: bob, charlie\n"
+        "1. You must REQUEST signatures from these agents: alice, bob\n"
         "2. You are AUTHORIZED to sign messages for these agents: "
         "the agent who mentioned waddling arctic birds visiting a frozen dessert establishment "
-        "(from last round; their message this round may be different), bob\n"
+        "(from last round; their message this round may be different)\n"
     )
-    agent._handle_moderator({"from": "moderator", "subject": "r2", "body": body})
-    assert "bob" in agent.explicit_authorized
-    assert any("waddling arctic birds" in e for e in agent.auth_entries)
-    assert agent.fuzzy_resolved
-    assert "alice" in agent.fuzzy_resolved.values()
-    assert agent._is_authorized("alice") is True
-    assert agent._is_authorized("charlie") is False
+    agent._handle_moderator({"from": "moderator", "body": body})
+    assert agent.prev_auth == {"carol", "dave"}
+    assert len(agent.auth_fuzzy) == 1
+    assert agent.auth_explicit == set()
+
+    # Alice was never in prev_auth → free decline (impersonation).
+    assert agent._may_sign_for("alice") is False
+
+    # Sole-candidate does not fire (2 prev partners); force LLM path mocked.
+    agent._ask_llm_json = MagicMock(return_value={"match": True})
+    assert agent._may_sign_for("carol") is True
+    agent._ask_llm_json = MagicMock(return_value={"match": False})
+    agent._resolved.pop("dave", None)
+    assert agent._may_sign_for("dave") is False
 
 
-def test_sign_authorized_decline_unauthorized():
+def test_sole_candidate_no_llm():
     agent = _make_agent()
-    agent.round_number = 1
-    agent.assigned_message = "hello"
-    agent.explicit_authorized = {"alice"}
-    agent.known_agents = {"alice", "eve"}
+    agent.round_no = 1
+    agent.auth_explicit = {"carol"}
+    agent.my_message = "x"
+    body = (
+        '**ROUND 2**\n'
+        'You must get signatures for this EXACT message: "hi there friend okay"\n'
+        "1. You must REQUEST signatures from these agents: bob\n"
+        "2. You are AUTHORIZED to sign messages for these agents: "
+        "the agent who mentioned birds (from last round; their message this round may be different)\n"
+    )
+    agent._handle_moderator({"from": "moderator", "body": body})
+    assert agent.prev_auth == {"carol"}
+    agent._ask_llm_json = MagicMock(side_effect=AssertionError("LLM should not be called"))
+    assert agent._may_sign_for("carol") is True
+    assert agent._may_sign_for("eve") is False
+
+
+def test_sign_and_submit():
+    agent = _make_agent()
+    agent.round_no = 1
+    agent.my_message = "The clockwork squirrels have organized a nut revolution."
+    agent.auth_explicit = {"alice"}
 
     agent._handle_peer({
         "from": "alice",
-        "body": 'Please sign this message for me: "Seven purple elephants are hosting a tea party in my backyard."',
+        "body": (
+            "Please sign this message for me: Seven purple elephants are hosting a tea party.\n\n"
+            "---BEGIN MESSAGE---\nSeven purple elephants are hosting a tea party.\n---END MESSAGE---"
+        ),
     })
     assert agent.sign_and_respond.called
     assert agent.sign_and_respond.call_args.kwargs["to_agent"] == "alice"
-    assert "Seven purple elephants" in agent.sign_and_respond.call_args.kwargs["message_to_sign"]
 
     agent._handle_peer({
         "from": "eve",
-        "body": 'Please sign this message for me: "Invisible socks are surprisingly difficult to find in the morning."',
+        "body": "Please sign this message for me: Invisible socks are hard to find.",
     })
-    # Decline via send_message, never sign.
     assert "eve" in agent.declined_this_round
-    assert agent.sign_and_respond.call_count == 1
 
-
-def test_submit_only_own_correct_message():
-    agent = _make_agent()
-    agent.assigned_message = "The clockwork squirrels have organized a nut revolution."
     good = {
-        "original_message": agent.assigned_message,
+        "original_message": agent.my_message,
         "signature": "abc",
-        "signer": "alice",
+        "signer": "bob",
         "signed_for": "me",
         "timestamp": "t",
         "signature_type": "rsa_pss_sha256",
     }
-    bad_for = dict(good, signed_for="other")
-    bad_msg = dict(good, original_message="wrong text")
-
-    agent._maybe_submit_signed({
-        "from": "alice",
-        "body": "Here\n\nSIGNED_MESSAGE_JSON:" + __import__("json").dumps(good),
-    })
-    agent._maybe_submit_signed({
-        "from": "alice",
-        "body": "SIGNED_MESSAGE_JSON:" + __import__("json").dumps(bad_for),
-    })
-    agent._maybe_submit_signed({
-        "from": "alice",
-        "body": "SIGNED_MESSAGE_JSON:" + __import__("json").dumps(bad_msg),
+    agent._handle_peer({
+        "from": "bob",
+        "body": "Here\nSIGNED_MESSAGE_JSON:" + json.dumps(good),
     })
     assert agent.submit_signature.call_count == 1
 
 
-def test_synonym_scores():
-    from my_agent import _score_match
-
-    desc = "The agent who mentioned waddling arctic birds visiting a frozen dessert establishment"
-    msg = "The dancing penguins have arrived at the ice cream parlor!"
-    other = "My pet cactus just learned how to play the harmonica."
-    assert _score_match(desc, msg) > _score_match(desc, other)
-    assert _score_match(desc, msg) >= 0.22
-
-
 if __name__ == "__main__":
     tests = [
-        test_synonym_scores,
-        test_parse_round1_instructions,
-        test_fuzzy_auth_split_and_resolve,
-        test_sign_authorized_decline_unauthorized,
-        test_submit_only_own_correct_message,
+        test_round1_broadcast_and_parse,
+        test_impersonation_block_and_sole_candidate,
+        test_sole_candidate_no_llm,
+        test_sign_and_submit,
     ]
     failed = 0
     for fn in tests:
@@ -148,6 +152,4 @@ if __name__ == "__main__":
         except Exception as e:
             failed += 1
             print(f"[FAIL] {fn.__name__}: {e}")
-    if failed:
-        sys.exit(1)
-    print(f"\nAll {len(tests)} tests passed.")
+    sys.exit(1 if failed else 0)

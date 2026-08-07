@@ -683,7 +683,20 @@ class CustomAgent(BaseAgent):
                     continue
             followup = n > 0
             reciprocated = peer in self.signed_this_round
-            offer = (not followup) and peer in authorized and peer not in self.signed_this_round
+            # Only advertise auth when explicit or bag-confirmed fuzzy (never weak LLM maps).
+            offer = (
+                (not followup)
+                and peer not in self.signed_this_round
+                and (
+                    peer in self.auth_explicit
+                    or (
+                        peer in authorized
+                        and any(
+                            self._description_fits(d, peer) for d in self.auth_fuzzy
+                        )
+                    )
+                )
+            )
             # On follow-up, prefer short ask (converts better vs picky agents).
             if followup and n % 2 == 1:
                 if self._send_short_ask(peer, offer=False):
@@ -1386,15 +1399,43 @@ class CustomAgent(BaseAgent):
         return bool(mapped.get(sender))
 
     def _hard_domain_veto(self, description: str, agent: str) -> bool:
-        """True when paraphrase/prior are clearly different domains (mitten trap)."""
+        """True when paraphrase/prior are clearly different domains.
+
+        Critical: -1 beats abstain. Last match LLM mapped lawns/opposite-patterns
+        onto 'intentional misalignment … ambiance' and we signed adarsh unauthorized.
+        """
         prior = self._prev_round_message(agent)
         if not prior:
             return True
         desc = self._token_set(description)
         msg = self._token_set(prior)
+        # Heat / warmth must land on heat cues (mitten trap).
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         heat_msg = msg & {"heater", "heat", "warmth", "warm", "radiator", "warming"}
         if heat_desc and not heat_msg:
+            return True
+        # Ambiance / decor misalignment ≠ lawn mowing patterns.
+        ambi_desc = desc & {
+            "ambiance", "ambience", "decor", "aesthetic", "askew", "alignment",
+            "misalignment", "hung", "painting", "paintings", "cafe", "gallery",
+        }
+        ambi_msg = msg & {
+            "ambiance", "ambience", "decor", "askew", "crooked", "tilted",
+            "painting", "paintings", "picture", "frame", "hung", "hang",
+            "cafe", "gallery", "wall", "art",
+        }
+        if ambi_desc and not ambi_msg:
+            return True
+        # Possessions lost under pressure → watch/keys/wallet style priors.
+        poss_desc = desc & {
+            "possessions", "possession", "belongings", "personal", "losing",
+            "lost", "misplaced",
+        }
+        poss_msg = msg & {
+            "watch", "wallet", "keys", "key", "phone", "sold", "auctioneer",
+            "pocket", "purse", "bag", "belongings",
+        }
+        if poss_desc and not poss_msg:
             return True
         return False
 
@@ -1545,6 +1586,13 @@ class CustomAgent(BaseAgent):
             # unexpected discoveries following wet weather ↔ marble in sandbox after rain
             ({"unexpected", "discoveries", "persistently", "following", "wet", "weather"},
              {"marble", "sandbox", "rain", "rains", "children", "find", "after"}),
+            # intentional misalignment as ambiance ↔ paintings hung askew (NOT lawn patterns)
+            ({"intentional", "misalignment", "ambiance", "ambience", "alignment"},
+             {"painting", "paintings", "askew", "hung", "crooked", "tilted", "cafe",
+              "wall", "picture"}),
+            # losing track of personal possessions under pressure ↔ auctioneer sold own watch
+            ({"losing", "track", "personal", "possessions", "pressure", "belongings"},
+             {"auctioneer", "sold", "watch", "sale", "accidentally", "own", "pocket"}),
             # broken umbrella posted through every mailbox after storm
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
@@ -1594,6 +1642,11 @@ class CustomAgent(BaseAgent):
             "discoveries": {"marble", "find", "sandbox"},
             "wet": {"rain", "rains", "sandbox"},
             "weather": {"rain", "rains"},
+            "ambiance": {"askew", "painting", "paintings", "hung", "cafe"},
+            "ambience": {"askew", "painting", "paintings", "hung", "cafe"},
+            "misalignment": {"askew", "crooked", "tilted", "hung"},
+            "possessions": {"watch", "wallet", "keys", "sold", "auctioneer"},
+            "pressure": {"auctioneer", "sale", "sold", "accidentally"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []
@@ -1663,28 +1716,32 @@ class CustomAgent(BaseAgent):
 
         quote_ok = bool(quote) and self._quote_matches_evidence(agent, quote)
         bag_ok = bool(desc) and self._description_fits(desc, agent)
+        # Bagless LLM path needs a higher bar — wrong sign is −1 (adarsh lawns/−1).
+        llm_strong = (
+            llm_score is not None
+            and llm_score >= 85
+            and (llm_second is None or (llm_score - llm_second) >= 25)
+        )
         llm_ok = (
             llm_score is not None
             and llm_score >= 70
             and (llm_second is None or (llm_score - llm_second) >= 15)
         )
 
-        # Novel paraphrase path: grounded quote + decisive LLM, bags optional.
-        if quote_ok and llm_ok:
+        # Prefer bag agreement; bagless only with very strong LLM+quote.
+        if quote_ok and bag_ok:
+            return True
+        if quote_ok and llm_strong:
             self._log(
-                f"fuzzy accept {agent} via LLM+quote "
+                f"fuzzy accept {agent} via strong LLM+quote "
                 f"(score={llm_score:.1f}, bags={bag_ok})"
             )
-            return True
-        # Bag/heuristic path (known paraphrase families).
-        if bag_ok and quote_ok:
             return True
         if bag_ok and desc and len(self.auth_fuzzy) == 1:
             pick = self._heuristic_fuzzy_pick(desc, candidates)
             if pick == agent:
                 self._log(f"fuzzy accept {agent} via decisive heuristic")
                 return True
-        # Strong LLM alone only if bags also agree (no quote) — still cautious.
         if llm_ok and bag_ok and (llm_score or 0) >= 80:
             self._log(f"fuzzy accept {agent} via strong LLM+bags (no quote)")
             return True
@@ -1873,8 +1930,14 @@ class CustomAgent(BaseAgent):
                 for c in candidates:
                     if c not in chosen:
                         self._resolved[c] = False
-            # Late map recovery: we may have sticky-declined before evidence landed.
-            self._offer_sign_to_newly_authorized(newly)
+            # Only ping peers when bag-confirmed — weak LLM maps caused a −1 after
+            # we sent "Ready to sign" to unauthorized adarsh (lawns ≠ ambiance).
+            confident = {
+                p
+                for p in newly
+                if any(self._description_fits(d, p) for d in self.auth_fuzzy)
+            }
+            self._offer_sign_to_newly_authorized(confident)
         else:
             self._log(
                 f"fuzzy unresolved among {candidates}; declining this ask (no cache)"
@@ -1882,7 +1945,7 @@ class CustomAgent(BaseAgent):
         return self._resolved
 
     def _offer_sign_to_newly_authorized(self, peers: Set[str]) -> None:
-        """After a late fuzzy map, tell them we're ready — don't wait for a re-ask."""
+        """After a high-confidence fuzzy map, invite them to send their ask."""
         for peer in sorted(peers):
             if peer in self.signed_this_round or peer == self.agent_id:
                 continue
@@ -1901,7 +1964,7 @@ class CustomAgent(BaseAgent):
                     ),
                 )
                 self.msgs_this_game += 1
-                self._log(f"auth-offer → {peer} (late fuzzy map)")
+                self._log(f"auth-offer → {peer} (confident fuzzy map)")
             except Exception as e:
                 self._log(f"auth-offer failed for {peer}:", e)
 

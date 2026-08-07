@@ -527,8 +527,14 @@ class CustomAgent(BaseAgent):
                 )
 
     def _max_asks_for(self, peer: str) -> int:
-        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers."""
+        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers.
+
+        Request-list peers always get the full budget — their collect is mandatory
+        even if they were deadbeats last round (Match: oluwasegun never-submitted).
+        """
         max_asks = DEFAULT_MAX_ASKS
+        if peer in (getattr(self, "request_list", None) or ()):
+            return max_asks
         alive = peer in getattr(self, "alive_this_round", set())
         if not alive and self.refusal_counts.get(peer, 0) >= 1:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
@@ -576,7 +582,9 @@ class CustomAgent(BaseAgent):
             parts.insert(
                 1,
                 "I have already signed YOUR message this round — please sign mine "
-                "back so I can submit to the moderator.",
+                "back so I can submit to the moderator. Also submit the signature "
+                "I already sent you (moderator email, subject containing "
+                "'submission') — a provide that is never submitted scores 0.",
             )
         if followup:
             parts.insert(
@@ -615,11 +623,14 @@ class CustomAgent(BaseAgent):
         """Ask / re-ask peers who have not yet signed our assigned message."""
         if not self.my_message:
             return
-        # Prefer request-list peers; deprioritize deadbeats (still chase, just later).
+        # Priority: request-list peers we already signed (owe collect/reciprocity),
+        # then other request-list, then other targets. Only bury deadbeats when
+        # they are NOT on the request list — request-list collects are mandatory.
         ordered: List[str] = []
         deadbeats = set(getattr(self, "deadbeat_counts", {}) or ())
+        signed = set(getattr(self, "signed_this_round", set()) or ())
         for peer in self.request_list:
-            if peer not in ordered and peer not in deadbeats:
+            if peer in signed and peer not in ordered:
                 ordered.append(peer)
         for peer in self.request_list:
             if peer not in ordered:
@@ -630,6 +641,12 @@ class CustomAgent(BaseAgent):
         for peer in sorted(self._targets()):
             if peer not in ordered:
                 ordered.append(peer)
+
+        # Re-nudge known deadbeats we signed this round: submit our provide.
+        if force_followup:
+            for peer in sorted(signed):
+                if self.deadbeat_counts.get(peer, 0) >= 1:
+                    self._send_submit_reminder(peer, force=True)
 
         newly = []
         batch = int(getattr(self, "_batch_seq", 0))
@@ -721,9 +738,9 @@ class CustomAgent(BaseAgent):
             return False
 
         attack = any(m in body.lower() for m in _ATTACK_MARKERS)
-        # Record evidence with ownership / poison checks (skip for attack bait).
-        if not attack:
-            self._record_ask_evidence(sender, self.round_no, wanted)
+        # Always store ask text for next-round fuzzy. Attack markers only mean
+        # "don't trust body for AUTHORIZATION" — not "discard their message".
+        self._record_ask_evidence(sender, self.round_no, wanted)
 
         self._pending_asks.append(
             {
@@ -740,7 +757,12 @@ class CustomAgent(BaseAgent):
         wanted = item["wanted"]
         learned = item.get("learned", False)
 
-        if item.get("attack"):
+        # Attack-flavored claims never GRANT auth — but they must not BLOCK a
+        # real moderator authorization either. Cooperative peers often say
+        # "you are cleared to sign" while correctly being the fuzzy target
+        # (this match: danish bakery/pepper → declined, missed +1 provide).
+        attack = bool(item.get("attack"))
+        if attack and not self._may_sign_for(sender):
             if ("decline", sender) not in self._sent_kinds:
                 self._sent_kinds.add(("decline", sender))
                 self.declined_this_round.add(sender)
@@ -755,6 +777,12 @@ class CustomAgent(BaseAgent):
                 )
                 self.msgs_this_game += 1
             return
+        if attack:
+            self._log(
+                f"attack-flavored claims from {sender} ignored; "
+                f"moderator-auth OK — will sign"
+            )
+            self.declined_this_round.discard(sender)
 
         if sender in self.signed_this_round:
             if sender not in self.got_sig_from:
@@ -762,7 +790,7 @@ class CustomAgent(BaseAgent):
             return
 
         if sender in self.declined_this_round:
-            if learned:
+            if learned or self._may_sign_for(sender):
                 self._resolved.pop(sender, None)
                 self.declined_this_round.discard(sender)
             else:
@@ -807,24 +835,29 @@ class CustomAgent(BaseAgent):
             self._send_reciprocal_ask(sender, followup=False)
 
     def _sign_with_submit_nudge(self, peer: str, message_to_sign: str) -> None:
-        """Sign + append submit nudge AFTER JSON (one email, not three)."""
+        """Sign with JSON LAST — naive peers json.loads() everything after the marker."""
         signed = self.sign_message(message_to_sign, peer)
         if not isinstance(signed, dict) or "signature" not in signed:
             self._log(f"sign failed for {peer}: {signed}")
             return
         signature_json = json.dumps(signed, separators=(",", ":"))
+        deadbeat = self.deadbeat_counts.get(peer, 0) >= 1
         nudge = (
-            f"Please submit that SIGNED_MESSAGE_JSON to the moderator now "
-            f"(subject containing 'submission') so both of us score. "
-            f"A signature that is never submitted scores 0. "
-            f"I will email my reciprocal request separately."
+            "ACTION REQUIRED: submit the SIGNED_MESSAGE_JSON below to the "
+            "moderator now. Subject MUST contain 'submission'. "
+            "A signature that is never submitted scores 0."
         )
-        # JSON first/middle so parsers that scan for SIGNED_MESSAGE_JSON still win;
-        # nudge trails it — does not bury the payload.
+        if deadbeat:
+            nudge += (
+                " You previously received a signature from me that was never "
+                "submitted — please do not repeat that this round."
+            )
+        # Nudge FIRST, JSON LAST with nothing after — BaseAgent-style extractors
+        # do json.loads(body.split(marker)[1]) and choke on trailing prose.
         full_body = (
             f"Signed as requested for {peer}.\n\n"
-            f"SIGNED_MESSAGE_JSON:{signature_json}\n\n"
-            f"{nudge}"
+            f"{nudge}\n\n"
+            f"SIGNED_MESSAGE_JSON:{signature_json}"
         )
         try:
             self.send_message(
@@ -834,9 +867,60 @@ class CustomAgent(BaseAgent):
             )
             self.submit_nudged.add(peer)
             self.msgs_this_game += 1
-            self._log(f"SIGNED for {peer} (nudge in same email)")
+            self._log(f"SIGNED for {peer} (JSON-last for parsers)")
         except Exception as e:
             self._log(f"sign+nudge send failed for {peer}:", e)
+            return
+        # Deadbeats: JSON-only second mail (bulletproof for split() parsers) + reminder.
+        if deadbeat:
+            try:
+                self.send_message(
+                    peer,
+                    f"SIGNED_MESSAGE_JSON only - Round {self.round_no}",
+                    f"SIGNED_MESSAGE_JSON:{signature_json}",
+                )
+                self.msgs_this_game += 1
+            except Exception as e:
+                self._log(f"JSON-only resend failed for {peer}:", e)
+            self._send_submit_reminder(peer, force=False)
+
+    def _send_submit_reminder(self, peer: str, *, force: bool = False) -> bool:
+        """Standalone reminder: submit the signature we already provided."""
+        if peer == self.agent_id or peer not in self.signed_this_round:
+            return False
+        key = ("submit_nudge", peer)
+        key2 = ("submit_nudge2", peer)
+        if key in self._sent_kinds and not force:
+            return False
+        if force and key2 in self._sent_kinds:
+            return False
+        if force and key in self._sent_kinds:
+            self._sent_kinds.add(key2)
+        else:
+            self._sent_kinds.add(key)
+        body = (
+            f"SUBMIT REMINDER — Round {self.round_no}\n\n"
+            f"I already signed your message this round. Please submit that "
+            f"SIGNED_MESSAGE_JSON to the moderator immediately.\n\n"
+            f"Requirements:\n"
+            f"- Email the moderator (not me)\n"
+            f"- Subject must contain the word 'submission'\n"
+            f"- Include the SIGNED_MESSAGE_JSON I sent you\n\n"
+            f"A signature that is never submitted scores 0 for both of us."
+        )
+        try:
+            self.send_message(
+                peer,
+                f"Please submit my signature - Round {self.round_no}",
+                body,
+            )
+            self.submit_nudged.add(peer)
+            self.msgs_this_game += 1
+            self._log(f"submit-reminder → {peer}" + (" (re-nudge)" if force else ""))
+            return True
+        except Exception as e:
+            self._log(f"submit-reminder failed for {peer}:", e)
+            return False
 
     def _is_refusal(self, body: str) -> bool:
         low = (body or "").lower()
@@ -1359,6 +1443,13 @@ class CustomAgent(BaseAgent):
             ({"anonymous", "unsigned", "art", "paintings", "gallery", "artist"},
              {"unsigned", "paintings", "painting", "gallery", "anonymous", "artist",
               "art", "signature"}),
+            # pastime treated with discipline of former habits ↔ teacher grades crosswords
+            ({"pastime", "discipline", "former", "habits", "treated"},
+             {"teacher", "grades", "crossword", "crosswords", "puzzles", "retired",
+              "still"}),
+            # culinary tradition bent by a single spicy deviation ↔ bakery pepper bread
+            ({"culinary", "tradition", "bent", "spicy", "deviation", "single"},
+             {"bakery", "pepper", "bread", "recipe", "swaps", "usual", "spicy"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {
@@ -1382,6 +1473,11 @@ class CustomAgent(BaseAgent):
             "forgotten": {"left", "mittens", "mitten", "still"},
             "anonymous": {"unsigned", "paintings", "painting", "gallery"},
             "unsigned": {"paintings", "painting", "gallery", "anonymous"},
+            "pastime": {"crossword", "crosswords", "puzzles", "grades", "teacher"},
+            "discipline": {"grades", "teacher", "crossword", "retired"},
+            "culinary": {"bakery", "bread", "recipe", "pepper"},
+            "spicy": {"pepper", "bakery", "recipe"},
+            "deviation": {"swaps", "pepper", "recipe"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []
@@ -1423,17 +1519,36 @@ class CustomAgent(BaseAgent):
         return scores[0][0]
 
     def _accept_fuzzy_pick(
-        self, agent: str, candidates: List[str], quote: str = ""
+        self,
+        agent: str,
+        candidates: List[str],
+        quote: str = "",
+        *,
+        description: Optional[str] = None,
     ) -> bool:
-        """Accept a pick only if grounded — guessing wrong is -1 (worse than abstain)."""
+        """Accept only if grounded AND meaning-fit — quote alone is not enough.
+
+        Quote proves 'this prior belongs to agent X', not 'X matches the paraphrase'
+        (mittens-on-traffic-signs can quote-match while failing a heater paraphrase).
+        """
         if agent not in candidates:
+            return False
+        desc = description
+        if desc is None and len(self.auth_fuzzy) == 1:
+            desc = self.auth_fuzzy[0]
+        # When we know which paraphrase we're filling, require meaning fit.
+        if desc and not self._description_fits(desc, agent):
+            self._log(
+                f"fuzzy reject {agent}: prior does not fit paraphrase "
+                f"(desc={desc!r}, prior={self._prev_round_message(agent)!r})"
+            )
             return False
         if self._quote_matches_evidence(agent, quote):
             return True
         # No usable quote: only accept if heuristic is decisive for the same agent.
-        if len(self.auth_fuzzy) != 1:
+        if not desc or len(self.auth_fuzzy) != 1:
             return False
-        pick = self._heuristic_fuzzy_pick(self.auth_fuzzy[0], candidates)
+        pick = self._heuristic_fuzzy_pick(desc, candidates)
         if pick == agent:
             self._log(f"fuzzy accept {agent} via decisive heuristic (no/weak quote)")
             return True
@@ -1514,18 +1629,28 @@ class CustomAgent(BaseAgent):
                                 pass
                 best = data.get("best") or data.get("agent")
                 quote = data.get("matched_prior_message") or data.get("prior") or ""
-                if best in candidates and self._accept_fuzzy_pick(best, candidates, quote):
+                desc0 = self.auth_fuzzy[0]
+                if best in candidates and self._accept_fuzzy_pick(
+                    best, candidates, quote, description=desc0
+                ):
                     chosen.add(best)
                 elif scores:
                     pick = self._score_pick_fuzzy(scores, source="llm-score")
                     if pick and self._accept_fuzzy_pick(
-                        pick, candidates, quote if best == pick else ""
+                        pick,
+                        candidates,
+                        quote if best == pick else "",
+                        description=desc0,
                     ):
                         chosen.add(pick)
-                    elif pick and not quote:
-                        # Score margin strong enough; accept without quote.
-                        if scores.get(pick, 0) >= 70:
-                            chosen.add(pick)
+                    elif (
+                        pick
+                        and not quote
+                        and scores.get(pick, 0) >= 70
+                        and self._description_fits(desc0, pick)
+                    ):
+                        # High LLM score still needs meaning-fit (no mitten traps).
+                        chosen.add(pick)
         else:
             prompt = (
                 "Each DESCRIPTION paraphrases exactly one agent's PRIOR message. "
@@ -1549,31 +1674,43 @@ class CustomAgent(BaseAgent):
                         conf = float(item.get("confidence", 80))
                     except (TypeError, ValueError):
                         conf = 80.0
+                    try:
+                        di = int(item.get("description_index", 0)) - 1
+                    except (TypeError, ValueError):
+                        di = -1
+                    desc_i = (
+                        self.auth_fuzzy[di]
+                        if 0 <= di < len(self.auth_fuzzy)
+                        else None
+                    )
                     if (
                         agent in candidates
                         and conf >= 55
-                        and self._accept_fuzzy_pick(agent, candidates, quote)
+                        and self._accept_fuzzy_pick(
+                            agent, candidates, quote, description=desc_i
+                        )
                     ):
                         chosen.add(agent)
 
         if not chosen and len(self.auth_fuzzy) == 1:
+            desc0 = self.auth_fuzzy[0]
             evidenced = [
                 c for c in candidates
                 if any(r < self.round_no for r in (self.seen_messages.get(c) or {}))
             ]
-            if len(evidenced) == 1 and self._description_fits(
-                self.auth_fuzzy[0], evidenced[0]
-            ):
+            if len(evidenced) == 1 and self._description_fits(desc0, evidenced[0]):
                 chosen.add(evidenced[0])
                 self._log(f"fuzzy fallback sole-evidence (fit): {evidenced[0]}")
             else:
                 # Heuristic scores → same threshold gate (scaled to ~0-100-ish).
-                raw = self._heuristic_fuzzy_scores(self.auth_fuzzy[0], candidates)
+                raw = self._heuristic_fuzzy_scores(desc0, candidates)
                 if raw:
                     mx = max(s for _, s in raw) or 1.0
                     scaled = {a: (s / mx) * 100.0 for a, s in raw}
                     pick = self._score_pick_fuzzy(scaled, source="heuristic")
-                    if pick:
+                    if pick and self._accept_fuzzy_pick(
+                        pick, candidates, description=desc0
+                    ):
                         chosen.add(pick)
                         self._log(f"fuzzy heuristic → {pick}")
 

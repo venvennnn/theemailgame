@@ -988,17 +988,36 @@ class CustomAgent(BaseAgent):
                 lines.append(f"- {c}: " + " | ".join(parts))
         return lines
 
-    def _heuristic_fuzzy_pick(
-        self, description: str, candidates: List[str]
-    ) -> Optional[str]:
-        """Cheap meaning overlap when the LLM abstains. Must be clearly decisive."""
-        desc = set(re.findall(r"[a-z0-9]+", description.lower()))
+    @staticmethod
+    def _token_set(text: str) -> Set[str]:
         stop = {
             "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at",
             "by", "with", "from", "who", "that", "this", "agent", "mentioned",
-            "their", "message", "round", "last", "different", "may",
+            "their", "message", "round", "last", "different", "may", "was",
+            "is", "are", "be", "been", "as", "it", "its",
         }
-        desc -= stop
+        return set(re.findall(r"[a-z0-9]+", (text or "").lower())) - stop
+
+    def _quote_matches_evidence(self, agent: str, quote: str) -> bool:
+        """Require the model to ground its pick in a prior message we actually saw."""
+        quote = _clean(quote or "")
+        if not quote or len(quote) < 8:
+            return False
+        prior = self._prev_round_message(agent) or ""
+        if not prior:
+            return False
+        if quote == prior or quote in prior or prior in quote:
+            return True
+        q, p = self._token_set(quote), self._token_set(prior)
+        if not q or not p:
+            return False
+        overlap = len(q & p) / max(1, len(q))
+        return overlap >= 0.6
+
+    def _heuristic_fuzzy_scores(
+        self, description: str, candidates: List[str]
+    ) -> List[Tuple[str, float]]:
+        desc = self._token_set(description)
         # Synonym bags keyed by description cues → message cues.
         bags = [
             ({"mystery", "origin", "unexpected", "gift", "unknown", "remembers"},
@@ -1015,25 +1034,57 @@ class CustomAgent(BaseAgent):
              {"broken", "cookies", "free", "bakery", "gives", "imperfect"}),
             ({"surplus", "garnish", "rejected", "meal", "untouched", "olive"},
              {"olive", "untouched", "sandwich", "deli", "single", "garnish"}),
+            # civic order + mischief ↔ rule-breaking / playful disorder in a public space
+            ({"civic", "order", "mischief", "tinged", "briefly", "rule", "prank"},
+             {"cat", "bookstore", "poetry", "skips", "lobby", "button", "presses",
+              "mischief", "prank", "statue", "fountain", "library", "park"}),
         ]
         scores: List[Tuple[str, float]] = []
         for c in candidates:
             msg = (self._prev_round_message(c) or "").lower()
             if not msg:
                 continue
-            words = set(re.findall(r"[a-z0-9]+", msg)) - stop
-            overlap = len(desc & words)
+            words = self._token_set(msg)
+            overlap = float(len(desc & words))
             bonus = 0.0
             for dbag, mbag in bags:
                 if desc & dbag and words & mbag:
                     bonus += 2.0 + len(words & mbag)
             scores.append((c, overlap + bonus))
         scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+
+    def _heuristic_fuzzy_pick(
+        self, description: str, candidates: List[str]
+    ) -> Optional[str]:
+        """Cheap meaning overlap when the LLM abstains. Must be clearly decisive."""
+        scores = self._heuristic_fuzzy_scores(description, candidates)
         if not scores or scores[0][1] < 2.0:
             return None
         if len(scores) > 1 and scores[0][1] - scores[1][1] < 1.5:
             return None
         return scores[0][0]
+
+    def _accept_fuzzy_pick(
+        self, agent: str, candidates: List[str], quote: str = ""
+    ) -> bool:
+        """Accept a pick only if grounded — guessing wrong is -1 (worse than abstain)."""
+        if agent not in candidates:
+            return False
+        if self._quote_matches_evidence(agent, quote):
+            return True
+        # No usable quote: only accept if heuristic is decisive for the same agent.
+        if len(self.auth_fuzzy) != 1:
+            return False
+        pick = self._heuristic_fuzzy_pick(self.auth_fuzzy[0], candidates)
+        if pick == agent:
+            self._log(f"fuzzy accept {agent} via decisive heuristic (no/weak quote)")
+            return True
+        self._log(
+            f"fuzzy reject {agent}: quote not grounded in evidence "
+            f"(quote={quote!r}, prior={self._prev_round_message(agent)!r})"
+        )
+        return False
 
     def _resolve_fuzzy_mapping(self, candidates: List[str]) -> Dict[str, bool]:
         # If we already positively mapped everyone we need, reuse.
@@ -1045,13 +1096,17 @@ class CustomAgent(BaseAgent):
 
         lines = self._evidence_lines(candidates)
         if not lines:
+            self._log(f"fuzzy: no prior evidence yet among {candidates}")
             return self._resolved
+
+        self._log("fuzzy evidence:\n" + "\n".join(lines))
 
         n = len(self.auth_fuzzy)
         prompt = (
             "You are resolving fuzzy agent identities in The Email Game.\n"
             "Each DESCRIPTION paraphrases exactly one agent's PRIOR-round assigned "
             "message using synonyms — lexical overlap may be near zero. Match MEANING.\n"
+            "CRITICAL: A wrong match costs -1. If unsure between two agents, return null.\n"
             "Examples:\n"
             "- 'mystery surrounding the origin of an unexpected gift' ↔ "
             "'No one remembers who planted the pear tree by the playground.'\n"
@@ -1061,26 +1116,31 @@ class CustomAgent(BaseAgent):
             "'Neighbors swap house keys once each year, just in case.'\n"
             "- 'persistent evidence of a rough season for home deliveries' ↔ "
             "'Every mailbox on the street wears dents from last winter's plow.'\n\n"
-            f"There are {n} description(s). Pick the best agent id for each. "
-            "You MUST pick when the meaning match is clear — do not omit a clear match.\n\n"
+            f"There are {n} description(s). For each clear match, return the agent id "
+            "AND quote their prior message from Evidence that the description paraphrases.\n\n"
             "Descriptions:\n"
             + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
             + "\n\nEvidence (agent id → prior messages):\n"
             + "\n".join(lines)
-            + '\n\nJSON only: {"matches": [{"description_index": 1, "agent": "<id>"}]}'
+            + "\n\nJSON only: "
+            '{"matches":[{"description_index":1,"agent":"<id>",'
+            '"matched_prior_message":"<exact prior text from Evidence>"}]} '
+            "or {\"matches\":[]} if unsure."
         )
         data = self._ask_llm_json(prompt)
         if (data is None or not (isinstance(data, dict) and (
             data.get("matches") or data.get("agent") or data.get("agents")
         ))) and len(self.auth_fuzzy) == 1:
-            # Forced choice between the candidates.
+            # Second pass: still require a grounded quote — never coin-flip.
             data = self._ask_llm_json(
-                "Forced choice: which ONE agent id does this paraphrase describe?\n"
-                "Pick the better meaning match. Reply with an id from the list, not null, "
-                "unless BOTH are clearly wrong.\n"
+                "Which ONE agent id does this paraphrase describe?\n"
+                "Only answer if you can quote their prior message from Evidence that "
+                "matches the description's MEANING. If both are plausible, agent=null.\n"
                 f"Description: {self.auth_fuzzy[0]}\n"
                 + "\n".join(lines)
-                + '\nJSON only: {"agent": "<id>"} or {"agent": null}'
+                + "\nJSON only: "
+                '{"agent":"<id>","matched_prior_message":"<exact prior text>"} '
+                'or {"agent":null}'
             )
 
         chosen: Set[str] = set()
@@ -1089,12 +1149,15 @@ class CustomAgent(BaseAgent):
                 if not isinstance(item, dict):
                     continue
                 agent = item.get("agent")
-                if agent in candidates:
+                quote = item.get("matched_prior_message") or item.get("prior") or ""
+                if agent and self._accept_fuzzy_pick(agent, candidates, quote):
                     chosen.add(agent)
             if not chosen and data.get("agent") in candidates:
-                chosen.add(data["agent"])
+                quote = data.get("matched_prior_message") or data.get("prior") or ""
+                if self._accept_fuzzy_pick(data["agent"], candidates, quote):
+                    chosen.add(data["agent"])
             for a in data.get("agents") or []:
-                if a in candidates:
+                if a in candidates and self._accept_fuzzy_pick(a, candidates, ""):
                     chosen.add(a)
 
         if not chosen and len(self.auth_fuzzy) == 1:
@@ -1118,7 +1181,10 @@ class CustomAgent(BaseAgent):
                 self._log(f"fuzzy mapped -> {c}")
         else:
             # Do NOT cache False for all candidates — allows retry on later asks.
-            self._log(f"fuzzy unresolved among {candidates}; declining this ask (no cache)")
+            self._log(
+                f"fuzzy unresolved among {candidates}; declining this ask (no cache) "
+                "— abstain beats a wrong -1"
+            )
         return self._resolved
 
     def _ask_llm_json(self, prompt: str) -> Optional[dict]:

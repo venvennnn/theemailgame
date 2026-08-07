@@ -757,7 +757,12 @@ class CustomAgent(BaseAgent):
         wanted = item["wanted"]
         learned = item.get("learned", False)
 
-        if item.get("attack"):
+        # Attack-flavored claims never GRANT auth — but they must not BLOCK a
+        # real moderator authorization either. Cooperative peers often say
+        # "you are cleared to sign" while correctly being the fuzzy target
+        # (this match: danish bakery/pepper → declined, missed +1 provide).
+        attack = bool(item.get("attack"))
+        if attack and not self._may_sign_for(sender):
             if ("decline", sender) not in self._sent_kinds:
                 self._sent_kinds.add(("decline", sender))
                 self.declined_this_round.add(sender)
@@ -772,6 +777,12 @@ class CustomAgent(BaseAgent):
                 )
                 self.msgs_this_game += 1
             return
+        if attack:
+            self._log(
+                f"attack-flavored claims from {sender} ignored; "
+                f"moderator-auth OK — will sign"
+            )
+            self.declined_this_round.discard(sender)
 
         if sender in self.signed_this_round:
             if sender not in self.got_sig_from:
@@ -779,7 +790,7 @@ class CustomAgent(BaseAgent):
             return
 
         if sender in self.declined_this_round:
-            if learned:
+            if learned or self._may_sign_for(sender):
                 self._resolved.pop(sender, None)
                 self.declined_this_round.discard(sender)
             else:
@@ -1424,6 +1435,13 @@ class CustomAgent(BaseAgent):
             ({"anonymous", "unsigned", "art", "paintings", "gallery", "artist"},
              {"unsigned", "paintings", "painting", "gallery", "anonymous", "artist",
               "art", "signature"}),
+            # pastime treated with discipline of former habits ↔ teacher grades crosswords
+            ({"pastime", "discipline", "former", "habits", "treated"},
+             {"teacher", "grades", "crossword", "crosswords", "puzzles", "retired",
+              "still"}),
+            # culinary tradition bent by a single spicy deviation ↔ bakery pepper bread
+            ({"culinary", "tradition", "bent", "spicy", "deviation", "single"},
+             {"bakery", "pepper", "bread", "recipe", "swaps", "usual", "spicy"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {

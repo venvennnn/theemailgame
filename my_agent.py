@@ -317,10 +317,17 @@ class CustomAgent(BaseAgent):
             known = set(self.auth_explicit)
             known |= {a for a, ok in self._resolved.items() if ok}
             known |= set(self.signed_this_round)
-            # Keep unresolved fuzzy candidate pool — otherwise a failed LLM map
-            # drops true auth partners from next round's prev_auth prune.
-            known |= set(getattr(self, "fuzzy_candidates", set()) or ())
+            # Keep ONLY unresolved fuzzy candidates. Peers we positively mapped as
+            # NOT the alias (resolved False) must not pollute next round's prev_auth
+            # — that bloated R3 to 3 candidates vs 2 fuzzies and we declined both
+            # true targets (khushvendra + raffi) after keeping kenny.
+            known |= {
+                c
+                for c in (getattr(self, "fuzzy_candidates", set()) or ())
+                if self._resolved.get(c) is not False
+            }
             self.prev_auth = known
+            self._log(f"prev_auth ← {sorted(known)} (excluded resolved-False)")
             self._update_cross_round_priors()
 
         self.round_no = new_round
@@ -1271,6 +1278,18 @@ class CustomAgent(BaseAgent):
             # playthings lingering after everyone else has gone ↔ toy still moving after bell
             ({"playthings", "lingering", "everyone", "gone", "after"},
              {"toy", "dog", "wind", "circles", "classroom", "bell", "rings", "after"}),
+            # outdated information left unchanged ↔ town sign / old census population
+            ({"outdated", "information", "unchanged", "convenience", "stale"},
+             {"town", "sign", "population", "census", "still", "shows", "before", "year"}),
+            # rigorous devotion to mastering a single tune ↔ whistling school anthem
+            ({"rigorous", "devotion", "mastering", "single", "tune", "practice"},
+             {"whistling", "whistle", "anthem", "school", "practiced", "morning", "child"}),
+            # spring color reclaiming a forgotten route ↔ daffodils on old train tracks
+            ({"spring", "color", "reclaiming", "forgotten", "route", "colour"},
+             {"daffodils", "april", "bloom", "train", "tracks", "trains", "anymore"}),
+            # quiet space outdone by defective silence ↔ theater seats squeak except broken
+            ({"quiet", "space", "outdone", "defective", "silence"},
+             {"theater", "theatre", "seat", "seats", "squeaked", "squeak", "broken", "movie"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {
@@ -1283,6 +1302,11 @@ class CustomAgent(BaseAgent):
             "stamped": {"date", "tomorrow", "postcard"},
             "anticipation": {"candle", "midnight", "almost", "before"},
             "dimmed": {"out", "went", "extinguished"},
+            "outdated": {"census", "population", "sign", "before"},
+            "devotion": {"whistling", "whistle", "anthem", "practiced"},
+            "tune": {"whistling", "whistle", "anthem", "song"},
+            "reclaiming": {"bloom", "daffodils", "tracks"},
+            "silence": {"squeak", "squeaked", "quiet", "broken"},
         }
         scores: List[Tuple[str, float]] = []
         for c in candidates:

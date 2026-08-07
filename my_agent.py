@@ -451,24 +451,23 @@ class CustomAgent(BaseAgent):
                 self._chase_outstanding(force_followup=False)
             return
 
-        # Authorized → sign FIRST, then ask for return (reciprocity = table stakes).
+        # Authorized → sign FIRST with a SHORT body so SIGNED_MESSAGE_JSON is
+        # trivial to find (burying it under a reciprocal ask was costing us the
+        # +1 signing point — peers never submitted). Chase theirs in a 2nd email.
         self.signed_this_round.add(sender)
         self.declined_this_round.discard(sender)
-        reciprocal_note = ""
-        if self.my_message:
-            reciprocal_note = (
-                f" I have signed yours — please sign mine back this round.\n\n"
-                + self._proof_request_body(followup=False, reciprocated=True)
-            )
         self.sign_and_respond(
             to_agent=sender,
             message_to_sign=wanted,
-            response_body="Signed as requested." + reciprocal_note,
+            response_body=(
+                f"Signed as requested for {sender}. "
+                "Please submit SIGNED_MESSAGE_JSON to the moderator this round "
+                "so it scores. I will email my reciprocal request separately."
+            ),
             subject=f"Signed Message - Round {self.round_no}",
         )
         self.msgs_this_game += 1
-        self._log(f"SIGNED for {sender} (+ reciprocal ask)")
-        # Also send a dedicated chase email so the ask isn't buried.
+        self._log(f"SIGNED for {sender}")
         if self.my_message and sender not in self.got_sig_from:
             self._send_reciprocal_ask(sender, followup=False)
 
@@ -603,6 +602,19 @@ class CustomAgent(BaseAgent):
             self._log(f"fuzzy sole-candidate: {sender}")
             return True
 
+        # If only ONE candidate has prior-round message evidence, it must be them.
+        # (Comp loss: R3 declined raffi after LLM miss despite having their R2 text.)
+        evidenced = [
+            c for c in candidates
+            if any(r < self.round_no for r in (self.seen_messages.get(c) or {}))
+        ]
+        if len(self.auth_fuzzy) == 1 and len(evidenced) == 1:
+            only = evidenced[0]
+            for c in candidates:
+                self._resolved[c] = c == only
+            self._log(f"fuzzy sole-evidence: {only}")
+            return bool(self._resolved.get(sender))
+
         mapped = self._resolve_fuzzy_mapping(candidates)
         return bool(mapped.get(sender))
 
@@ -629,17 +641,19 @@ class CustomAgent(BaseAgent):
                 self._resolved[c] = False
             return self._resolved
 
+        # Prefer the immediately previous round's text in the prompt.
         n = len(self.auth_fuzzy)
         prompt = (
             "You are resolving fuzzy agent identities in The Email Game.\n"
-            "Each DESCRIPTION is a deliberate synonym paraphrase of exactly one "
-            "agent's PRIOR-round assigned message. Word overlap may be near zero.\n"
-            "Think about meaning: e.g. 'waddling arctic birds'↔penguins; "
-            "'water and nostalgia mixing as the day ends'↔fountain + old radio at dusk; "
-            "'invitation left unanswered in the evening'↔a dance floor no one uses after dusk; "
-            "'redundancy in pursuit of uninterrupted readiness'↔backup/spare for continuous uptime.\n\n"
-            f"There are {n} description(s). Pick at most one agent id per description. "
-            "Use only ids from the evidence. If unsure for a description, omit it.\n\n"
+            "Each DESCRIPTION paraphrases exactly one agent's PRIOR-round assigned "
+            "message using synonyms — lexical overlap may be near zero. Match MEANING.\n"
+            "Examples: 'waddling arctic birds'↔penguins; "
+            "'water and nostalgia as the day ends'↔fountain + old radio at dusk; "
+            "'preparation resulting in deliberate disregard'↔ready/prepared then "
+            "ignoring/skipping/disregarding something on purpose.\n\n"
+            f"Pick at most one agent id per description ({n} description(s)). "
+            "Only use ids from the evidence. Prefer the message from the most recent "
+            "prior round when several are listed. If truly unsure, omit.\n\n"
             "Descriptions:\n"
             + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
             + "\n\nEvidence (agent id → prior messages):\n"
@@ -647,6 +661,16 @@ class CustomAgent(BaseAgent):
             + '\n\nJSON only: {"matches": [{"description_index": 1, "agent": "<id>"}]}'
         )
         data = self._ask_llm_json(prompt)
+        if data is None:
+            # One retry with a stricter single-description form.
+            if len(self.auth_fuzzy) == 1:
+                data = self._ask_llm_json(
+                    "Which ONE agent does this paraphrase describe?\n"
+                    f"Description: {self.auth_fuzzy[0]}\n"
+                    + "\n".join(lines)
+                    + '\nJSON only: {"agent": "<id>"} or {"agent": null}'
+                )
+
         chosen: Set[str] = set()
         if isinstance(data, dict):
             for item in data.get("matches") or []:
@@ -660,6 +684,16 @@ class CustomAgent(BaseAgent):
             for a in data.get("agents") or []:
                 if a in candidates:
                     chosen.add(a)
+
+        # Last resort: 1 fuzzy slot, LLM failed, exactly one evidenced candidate.
+        if not chosen and len(self.auth_fuzzy) == 1:
+            evidenced = [
+                c for c in candidates
+                if any(r < self.round_no for r in (self.seen_messages.get(c) or {}))
+            ]
+            if len(evidenced) == 1:
+                chosen.add(evidenced[0])
+                self._log(f"fuzzy fallback sole-evidence: {evidenced[0]}")
 
         for c in candidates:
             self._resolved[c] = c in chosen

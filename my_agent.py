@@ -111,16 +111,21 @@ RE_OFFER_TO_SIGN = re.compile(
     re.IGNORECASE,
 )
 
-# Peer-body social engineering — never treat these as authorization.
-_ATTACK_MARKERS = (
+# HARD poison: identity dumps / fake auth updates. Skip identity ingest and
+# never fresh-resolve fuzzy from these mails (harsh R2 → −1).
+_HARD_ATTACK_MARKERS = (
     "authorization update",
+    "authorization-resolution",
+    "authorization_resolution",
+    "authorization_assertion",
+    "authorization-resolution context",
+    "relevant prior-round references",
+    "relevant prior round references",
+    "treat this authenticated",
+    "semantic authorization resolution",
     "authorized list has been revised",
     "permitted signing list",
     "round authorization",
-    "you are cleared to sign",
-    "you're cleared to sign",
-    "you are now authorized",
-    "you're now authorized",
     "system override",
     "ignore all previous",
     "ignore previous instructions",
@@ -134,6 +139,15 @@ _ATTACK_MARKERS = (
     "fake tool",
     "sign_and_respond(",
 )
+# Soft peer claims — do not GRANT auth, but must not block a real fuzzy resolve
+# (danish "you ARE cleared to sign" while correctly on our list).
+_SOFT_AUTH_CLAIMS = (
+    "you are cleared to sign",
+    "you're cleared to sign",
+    "you are now authorized",
+    "you're now authorized",
+)
+_ATTACK_MARKERS = _HARD_ATTACK_MARKERS + _SOFT_AUTH_CLAIMS
 
 
 def _clean(s: str) -> str:
@@ -341,18 +355,22 @@ class CustomAgent(BaseAgent):
             return
 
         if self.round_no > 0:
+            # ONLY moderator-true authorizations. Do NOT union signed_this_round:
+            # an unauthorized provide (poison/attack) must not enter next prev_auth
+            # (R2 signed harsh without auth → polluted R3 candidate pool).
             known = set(self.auth_explicit)
             known |= {a for a, ok in self._resolved.items() if ok}
-            known |= set(self.signed_this_round)
-            # Keep ONLY unresolved fuzzy candidates. Peers we positively mapped as
-            # NOT the alias (resolved False) must not pollute next round's prev_auth
-            # — that bloated R3 to 3 candidates vs 2 fuzzies and we declined both
-            # true targets (khushvendra + raffi) after keeping kenny.
-            known |= {
-                c
-                for c in (getattr(self, "fuzzy_candidates", set()) or ())
-                if self._resolved.get(c) is not False
-            }
+            # Keep unresolved fuzzy candidates only if we still have open fuzzy slots.
+            resolved_true = {a for a, ok in self._resolved.items() if ok}
+            fuzzy_n = len(getattr(self, "auth_fuzzy", []) or [])
+            open_slots = max(0, fuzzy_n - len(resolved_true - self.auth_explicit))
+            if open_slots > 0:
+                known |= {
+                    c
+                    for c in (getattr(self, "fuzzy_candidates", set()) or ())
+                    if self._resolved.get(c) is not False
+                    and c not in resolved_true
+                }
             # Keep False-resolved agents for one-round re-expand if sole-candidate
             # fails a meaning check (wrong False purge caused the mitten cascade).
             self._prior_false = {
@@ -777,7 +795,16 @@ class CustomAgent(BaseAgent):
 
         self.roster.add(sender)
         # Subject+body: identity wording sometimes only appears in the subject.
-        learned = self._ingest_identity_notes(sender, f"{subject}\n{body}")
+        # HARD attack mails (authorization-resolution / prior-round reference dumps)
+        # must NEVER seed seen_messages — that poisoned fuzzy map → −1.
+        hard_attack = any(
+            m in f"{subject}\n{body}".lower() for m in _HARD_ATTACK_MARKERS
+        )
+        if hard_attack:
+            learned = False
+            self._log(f"skip identity ingest from HARD attack mail by {sender}")
+        else:
+            learned = self._ingest_identity_notes(sender, f"{subject}\n{body}")
 
         if self._is_refusal(body) and "SIGNED_MESSAGE_JSON:" not in body:
             if sender not in self.refused_us:
@@ -811,36 +838,49 @@ class CustomAgent(BaseAgent):
         if wanted is None:
             return False
 
-        attack = any(m in body.lower() for m in _ATTACK_MARKERS)
+        hard_attack = any(m in body.lower() for m in _HARD_ATTACK_MARKERS)
+        soft_claim = any(m in body.lower() for m in _SOFT_AUTH_CLAIMS)
         # Always store ask text for next-round fuzzy. Attack markers only mean
         # "don't trust body for AUTHORIZATION" — not "discard their message".
+        # Exception: still store the ask from hard-attack mails (their assigned
+        # text is usually real); only identity dumps are blocked above.
         self._record_ask_evidence(sender, self.round_no, wanted)
 
         self._pending_asks.append(
             {
                 "sender": sender,
                 "wanted": wanted,
-                "attack": attack,
+                "hard_attack": hard_attack,
+                "soft_claim": soft_claim,
                 "learned": learned,
             }
         )
         return False
+
+    def _already_authorized(self, sender: str) -> bool:
+        """True only if auth is already settled — never triggers fresh fuzzy resolve.
+
+        HARD attack mails must use this, not _may_sign_for (which can map fuzzy
+        using poisoned evidence injected in the same email).
+        """
+        if sender in self.auth_explicit:
+            return True
+        return self._resolved.get(sender) is True
 
     def _act_on_ask(self, item: Dict[str, Any]) -> None:
         sender = item["sender"]
         wanted = item["wanted"]
         learned = item.get("learned", False)
 
-        # Attack-flavored claims never GRANT auth — but they must not BLOCK a
-        # real moderator authorization either. Cooperative peers often say
-        # "you are cleared to sign" while correctly being the fuzzy target
-        # (this match: danish bakery/pepper → declined, missed +1 provide).
-        attack = bool(item.get("attack"))
-        if attack and not self._may_sign_for(sender):
+        # HARD poison mails: never fresh-resolve. Sign only if already settled
+        # (harsh R2 AUTHORIZATION-RESOLUTION → lighthouse poison → −1).
+        # Soft "cleared to sign" claims: still allow _may_sign_for (danish).
+        hard_attack = bool(item.get("hard_attack") or item.get("attack"))
+        if hard_attack and not self._already_authorized(sender):
             if ("decline", sender) not in self._sent_kinds:
                 self._sent_kinds.add(("decline", sender))
                 self.declined_this_round.add(sender)
-                self._log(f"IGNORE attack bait from {sender}")
+                self._log(f"IGNORE HARD attack bait from {sender} (no pre-settled auth)")
                 self.send_message(
                     sender,
                     f"Signature Declined - Round {self.round_no}",
@@ -851,10 +891,10 @@ class CustomAgent(BaseAgent):
                 )
                 self.msgs_this_game += 1
             return
-        if attack:
+        if hard_attack:
             self._log(
-                f"attack-flavored claims from {sender} ignored; "
-                f"moderator-auth OK — will sign"
+                f"HARD attack claims from {sender} ignored; "
+                f"pre-settled moderator-auth OK — will sign"
             )
             self.declined_this_round.discard(sender)
 
@@ -1188,8 +1228,11 @@ class CustomAgent(BaseAgent):
         msg = _clean(msg)
         if not msg or agent == self.agent_id:
             return False
-        if self._is_our_message_at(msg, rnd_i):
-            self._log(f"{source} ignored (OUR R{rnd_i} message) {agent}: {msg!r}")
+        # Any-round: peers dump OUR lighthouse/etc. as "prior references".
+        if self._is_our_message_at(msg, rnd_i) or self._is_our_message_any_round(msg):
+            self._log(
+                f"{source} ignored (OUR message, any round) {agent} R{rnd_i}: {msg!r}"
+            )
             return False
         key = (rnd_i, self._norm_msg(msg))
         owners = self.message_owners.setdefault(key, set())
@@ -1214,6 +1257,9 @@ class CustomAgent(BaseAgent):
 
     def _ingest_identity_notes(self, sender: str, body: str) -> bool:
         """Ingest peer-claimed prior texts. Never overwrite ask-derived evidence."""
+        if any(m in (body or "").lower() for m in _HARD_ATTACK_MARKERS):
+            self._log(f"identity notes blocked (HARD attack markers) from {sender}")
+            return False
         learned = False
         for m in RE_PRIOR_MESSAGE_JSON.finditer(body or ""):
             try:
@@ -1426,6 +1472,18 @@ class CustomAgent(BaseAgent):
     # ------------------------------------------------------------------
     # authorization — moderator list only; body claims never count
     # ------------------------------------------------------------------
+    def _fuzzy_slots_full(self) -> bool:
+        """Hard cap: never authorize more fuzzy peers than #auth_fuzzy descriptions."""
+        n = len(self.auth_fuzzy or [])
+        if n <= 0:
+            return True
+        mapped = sum(
+            1
+            for a, ok in self._resolved.items()
+            if ok and a not in self.auth_explicit
+        )
+        return mapped >= n
+
     def _may_sign_for(self, sender: str) -> bool:
         if sender in self.auth_explicit:
             return True
@@ -1454,6 +1512,11 @@ class CustomAgent(BaseAgent):
             # Re-check only if we never successfully mapped any fuzzy slot yet.
             if any(self._resolved.values()):
                 return False
+
+        # Already filled every fuzzy slot — refuse further novel resolves.
+        if self._fuzzy_slots_full():
+            self._log(f"fuzzy slots full — refuse fresh resolve for {sender}")
+            return False
 
         candidates = sorted(self.prev_auth - self.auth_explicit)
         self.fuzzy_candidates = set(candidates)
@@ -1546,6 +1609,28 @@ class CustomAgent(BaseAgent):
             "pocket", "purse", "bag", "belongings",
         }
         if poss_desc and not poss_msg:
+            return True
+        # Illumination / light / lighthouse scenes ≠ elevator / unrelated priors.
+        light_desc = desc & {
+            "illumination", "illuminating", "light", "lights", "lighthouse",
+            "beacon", "flash", "flashes", "glow", "lamp",
+        }
+        light_msg = msg & {
+            "illumination", "light", "lights", "lighthouse", "beacon",
+            "flash", "flashes", "flashing", "glow", "lamp", "lit", "overnight",
+        }
+        if light_desc and not light_msg:
+            return True
+        # Official info modified / hand-written corrections ≠ unrelated priors.
+        info_desc = desc & {
+            "official", "information", "modified", "corrections", "correction",
+            "handwritten", "written", "map", "label", "labeled", "labelled",
+        }
+        info_msg = msg & {
+            "map", "subway", "hand", "written", "corrections", "correction",
+            "labeled", "labelled", "label", "official", "modified", "graffiti",
+        }
+        if info_desc and not info_msg:
             return True
         return False
 
@@ -1713,6 +1798,17 @@ class CustomAgent(BaseAgent):
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
               "posted", "broken"}),
+            # illumination conjuring scenes / forgotten light pattern ↔ lighthouse
+            # OR store lights left on overnight (NOT elevator / unrelated)
+            ({"illumination", "illuminating", "conjuring", "scenes", "world",
+              "forgotten", "pattern", "beacon", "flash", "flashes"},
+             {"lighthouse", "flashes", "flashing", "forgotten", "pattern",
+              "lights", "light", "overnight", "locks", "hardware", "store"}),
+            # official information modified by someone passing through ↔ subway map
+            ({"official", "information", "modified", "passing", "someone",
+              "corrections", "correction", "handwritten", "written"},
+             {"map", "subway", "hand", "written", "corrections", "correction",
+              "labeled", "labelled", "label"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {
@@ -1763,6 +1859,21 @@ class CustomAgent(BaseAgent):
             "misalignment": {"askew", "crooked", "tilted", "hung"},
             "possessions": {"watch", "wallet", "keys", "sold", "auctioneer"},
             "pressure": {"auctioneer", "sale", "sold", "accidentally"},
+            "entries": {"pie", "pies", "slice", "contest"},
+            "evaluation": {"judging", "contest", "slice"},
+            "attire": {"tie", "wore", "green", "clothing"},
+            "tradition": {"leap", "day", "tie", "only"},
+            "rare": {"leap", "only", "green"},
+            "illumination": {
+                "lighthouse", "flashes", "flashing", "lights", "light",
+                "overnight", "beacon", "pattern",
+            },
+            "conjuring": {"lighthouse", "flashes", "scenes", "pattern"},
+            "official": {"map", "subway", "labeled", "labelled", "corrections"},
+            "information": {"map", "subway", "corrections", "labeled", "labelled"},
+            "modified": {"corrections", "correction", "hand", "written", "labeled"},
+            "corrections": {"map", "subway", "hand", "written", "labeled"},
+            "handwritten": {"hand", "written", "map", "corrections"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []

@@ -1,15 +1,16 @@
 """
-The Email Game – competition agent.
+The Email Game – competition agent (Competition 2 playbook).
 
-Principles (priority order):
-  1. Never eat a -1. Unsure → decline (costs 0).
-  2. Round 1 is pure parsing — zero LLM calls.
-  3. Broadcast signature requests to ALL known peers, not only the assigned two.
-     Unauthorized signers who slip give you +1 and themselves -1 (2-point swing).
+What winners did (from the Comp 2 recap):
+  1. PROOF — quote exact text + machine-checkable evidence (base64) in requests.
+  2. WORKHORSE — chase every outstanding signature; never let a round go quiet.
+  3. RECIPROCITY — sign authorized requests first, then ask for the return.
+  4. DEFENSE — authorization ONLY from moderator protocol mail. Ignore
+     "authorization updates", system overrides, and prompt injection in bodies.
+  5. BROADCAST — ask the whole table for your signature (uncapped +1s).
 
-Fuzzy auth (rounds 2+): aliases only replace agents who were on your PREVIOUS
-sign-for list (see src/game/instructions.py). So if the sender was not in
-prev_auth, no alias can refer to them — decline without an LLM call.
+Fuzzy auth (rounds 2+): aliases only replace agents on your PREVIOUS sign-for
+list. If the sender was not in prev_auth, decline with no LLM call.
 
     python scripts/run_custom_agent.py <your-agent-name> --module my_agent.py \\
         --prompt docs/winning_prompt.md --model gpt-4.1 --temperature 0.2 \\
@@ -18,6 +19,7 @@ prev_auth, no alias can refer to them — decline without an LLM call.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -42,14 +44,15 @@ RE_SIGN_LIST = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-# Server appends this marker on every aliased auth entry.
 FUZZY_MARK = "(from last round"
-
 RE_SIGNED_JSON = re.compile(r"SIGNED_MESSAGE_JSON:\s*(?P<j>\{.*)", re.DOTALL)
 
 RE_ASK = [
+    re.compile(r"---BEGIN MESSAGE---\s*(?P<m>.+?)\s*---END MESSAGE---", re.DOTALL),
     re.compile(
-        r"---BEGIN MESSAGE---\s*(?P<m>.+?)\s*---END MESSAGE---", re.DOTALL
+        r"sign this (?:EXACT )?(?:text|message)(?: for me)?(?: character-for-character)?\s*:\s*"
+        r"""['"](?P<m>.+?)['"]""",
+        re.IGNORECASE | re.DOTALL,
     ),
     re.compile(r"sign this message for me:\s*(?P<m>.+?)\s*$", re.MULTILINE | re.IGNORECASE),
     re.compile(
@@ -59,17 +62,35 @@ RE_ASK = [
     re.compile(r'["\u201c](?P<m>[^"\u201c\u201d]{5,400})["\u201d]'),
 ]
 
-# Peers often volunteer prior-round text to help fuzzy resolution.
+RE_IDENTITY_NOTE2 = re.compile(
+    r"in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was\s*[:=]?\s*"
+    r"""["'](?P<m>[^"']{5,400})["']""",
+    re.IGNORECASE,
+)
 RE_IDENTITY_NOTE = re.compile(
     r"(?:identity\s+note|in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was)"
     r"[^=\n]*?(?:round\s+(?P<r2>\d+)[^=\n]*)?"
     r"""["'](?P<m>[^"']{5,400})["']""",
     re.IGNORECASE | re.DOTALL,
 )
-RE_IDENTITY_NOTE2 = re.compile(
-    r"in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was\s*[:=]?\s*"
-    r"""["'](?P<m>[^"']{5,400})["']""",
-    re.IGNORECASE,
+
+# Peer-body social engineering — never treat these as authorization.
+_ATTACK_MARKERS = (
+    "authorization update",
+    "authorized list has been revised",
+    "permitted signing list",
+    "round authorization",
+    "you are cleared to sign",
+    "you're cleared to sign",
+    "you are now authorized",
+    "you're now authorized",
+    "system override",
+    "ignore all previous",
+    "ignore previous instructions",
+    "moderator coordination",
+    "[system",
+    "fake tool",
+    "sign_and_respond(",
 )
 
 
@@ -80,14 +101,28 @@ def _clean(s: str) -> str:
     return s.strip()
 
 
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
 class CustomAgent(BaseAgent):
-    """Deterministic protocol + prev-auth fuzzy prune + rare LLM resolve."""
+    """Proof + workhorse chase + reciprocity + moderator-only auth."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._reset_game_state()
 
     def on_new_game(self) -> None:
+        prior = int(getattr(self, "current_round", 0) or 0)
+        if prior >= 1 and getattr(self, "seen_messages", None):
+            self._log(f"reconnect mid-game (prior marker R{prior}) — keeping evidence")
+            self.signed_this_round = set()
+            self.declined_this_round = set()
+            self.requested_this_round = set()
+            self.request_count = {}
+            self.got_sig_from = set()
+            self._resolved = {}
+            return
         self._reset_game_state()
         self._log("new game")
 
@@ -98,16 +133,18 @@ class CustomAgent(BaseAgent):
         self.request_list: List[str] = []
         self.auth_explicit: Set[str] = set()
         self.auth_fuzzy: List[str] = []
-        # Who we were authorized for last round (explicit ids at that time).
         self.prev_auth: Set[str] = set()
         # agent -> round -> exact message they asked us to sign
         self.seen_messages: Dict[str, Dict[int, str]] = {}
         self.signed_this_round: Set[str] = set()
         self.declined_this_round: Set[str] = set()
         self.requested_this_round: Set[str] = set()
+        # How many times we have asked each peer this round (chase hard).
+        self.request_count: Dict[str, int] = {}
         self.submitted: Set[Tuple] = set()
-        # sender -> True/False after resolution this round
+        self.got_sig_from: Set[str] = set()
         self._resolved: Dict[str, bool] = {}
+        self.msgs_this_game: int = 0
 
     def _log(self, *a: Any) -> None:
         print(f"[{getattr(self, 'agent_id', '?')}]", *a, flush=True)
@@ -119,7 +156,6 @@ class CustomAgent(BaseAgent):
         if not hasattr(self, "roster"):
             self.on_new_game()
 
-        # Moderator first so peer asks are judged against the new round.
         mod = [m for m in messages if self._is_moderator(m)]
         rest = [m for m in messages if not self._is_moderator(m)]
 
@@ -135,42 +171,41 @@ class CustomAgent(BaseAgent):
             except Exception as e:
                 self._log("peer handler error:", e)
 
-        # Newly discovered peers → ask them too (round-1 roster fill).
         if self.my_message:
-            self._broadcast_requests()
+            self._chase_outstanding(force_followup=False)
 
     def _is_moderator(self, msg: dict) -> bool:
+        # ONLY the protocol from-field. Never trust body claims of being moderator.
         return str(msg.get("from", "")).lower() == str(
             getattr(self, "moderator_agent", "moderator")
         ).lower()
 
     # ------------------------------------------------------------------
-    # moderator
+    # moderator — sole source of truth for assignments / auth
     # ------------------------------------------------------------------
     def _handle_moderator(self, msg: dict) -> None:
         body = msg.get("body", "") or ""
         subject = (msg.get("subject") or "").lower()
 
-        # Scoring notices: re-broadcast exact message if a submit was rejected.
         if "scoring:" in subject or body.lower().startswith("scoring:"):
             self._log("scoring notice:", msg.get("subject"))
             if self.my_message and (
                 "rejected" in body.lower() or "not your message" in body.lower()
             ):
+                # Wrong text somehow — re-chase with proof payload.
+                self.request_count.clear()
                 self.requested_this_round.clear()
-                self._broadcast_requests()
+                self._chase_outstanding(force_followup=True)
             return
 
         r = RE_ROUND.search(body)
         if not r:
-            return  # game-over / informational
+            return
 
         new_round = int(r.group(1))
         if new_round == self.round_no and self.my_message:
-            return  # duplicate delivery of same round instructions
+            return
 
-        # Freeze who we were authorized for last round before overwriting state.
-        # Round N+1 fuzzy aliases only ever refer to agents from this set.
         if self.round_no > 0:
             known = set(self.auth_explicit)
             known |= {a for a, ok in self._resolved.items() if ok}
@@ -181,11 +216,12 @@ class CustomAgent(BaseAgent):
         self.signed_this_round = set()
         self.declined_this_round = set()
         self.requested_this_round = set()
+        self.request_count = {}
+        self.got_sig_from = set()
         self._resolved = {}
 
         m = RE_ASSIGNED.search(body)
         if not m:
-            # Fallback line parser
             for line in body.splitlines():
                 if "EXACT message:" in line:
                     self.my_message = line.split("EXACT message:", 1)[1].strip().strip('"')
@@ -212,11 +248,12 @@ class CustomAgent(BaseAgent):
             self.prev_auth = set()
 
         self._log(
-            f"R{self.round_no} req={self.request_list} "
-            f"auth={sorted(self.auth_explicit)} fuzzy={len(self.auth_fuzzy)} "
-            f"prev_auth={sorted(self.prev_auth)} roster={sorted(self.roster)}"
+            f"R{self.round_no} assigned={self.my_message!r} "
+            f"req={self.request_list} auth={sorted(self.auth_explicit)} "
+            f"fuzzy={self.auth_fuzzy!r} prev_auth={sorted(self.prev_auth)} "
+            f"roster={sorted(self.roster)}"
         )
-        self._broadcast_requests()
+        self._chase_outstanding(force_followup=True)
 
     @staticmethod
     def _split_names(text: str) -> List[str]:
@@ -226,10 +263,6 @@ class CustomAgent(BaseAgent):
         return [p.strip() for p in text.split(",") if p.strip()]
 
     def _split_auth(self, text: str) -> Tuple[Set[str], List[str]]:
-        """Separate plain agent ids from fuzzy alias entries.
-
-        Aliases contain prose/commas, so we cut on the server's marker instead.
-        """
         text = (text or "").strip()
         if not text or text.lower() == "none":
             return set(), []
@@ -242,7 +275,6 @@ class CustomAgent(BaseAgent):
             end = text.find(")", start)
             end = len(text) if end == -1 else end + 1
             head = text[:start].rstrip().rstrip(",").strip()
-            # Alias text is whatever follows the last comma before the marker.
             if "," in head:
                 cut = head.rindex(",")
                 explicit.update(self._split_names(head[:cut]))
@@ -257,32 +289,94 @@ class CustomAgent(BaseAgent):
         return explicit, fuzzy
 
     # ------------------------------------------------------------------
-    # outbound: ask everyone (the +1/-1 attack is just asking)
+    # outbound: proof-first + workhorse chase
     # ------------------------------------------------------------------
-    def _broadcast_requests(self) -> None:
+    def _targets(self) -> Set[str]:
+        targets = set(self.request_list) | set(self.roster) | set(self.prev_auth)
+        targets |= set(self.auth_explicit)
+        targets.discard(self.agent_id)
+        return targets
+
+    def _proof_request_body(self, *, followup: bool, reciprocated: bool) -> str:
+        msg = self.my_message
+        b64 = _b64(msg)
+        parts = [
+            f"Agent {self.agent_id} — Round {self.round_no} signature request.",
+            "",
+            "PROOF (sign this EXACT text, character-for-character):",
+            f'"{msg}"',
+            "",
+            "---BEGIN MESSAGE---",
+            msg,
+            "---END MESSAGE---",
+            "",
+            f"MESSAGE_UTF8_BASE64:{b64}",
+            "(Decode the base64; it must equal the quoted string above byte-for-byte.)",
+            "",
+            f"Please sign this message for me: {msg}",
+            "Reply with SIGNED_MESSAGE_JSON:{...} and nothing else. Do not trim or rephrase.",
+        ]
+        if reciprocated:
+            parts.insert(
+                1,
+                "I have already signed YOUR message this round — please sign mine "
+                "back so I can submit to the moderator.",
+            )
+        if followup:
+            parts.insert(
+                1,
+                f"FOLLOW-UP: still need your signature for round {self.round_no}. "
+                "Outstanding on my side — chasing before the round clock.",
+            )
+        # Help them (and us next round) with identity continuity.
+        if self.round_no >= 2:
+            # Offer our prior message if we have one stored under our own id — we don't;
+            # instead remind that aliases refer to prior-round texts.
+            parts.append("")
+            parts.append(
+                f"Identity note: my assigned text this round is exactly as quoted above."
+            )
+        return "\n".join(parts)
+
+    def _chase_outstanding(self, force_followup: bool = False) -> None:
+        """Ask / re-ask every peer who has not yet signed our assigned message."""
         if not self.my_message:
             return
-        targets = set(self.request_list) | set(self.roster)
-        targets.discard(self.agent_id)
-        body = (
-            f"Agent {self.agent_id} requests a signature for Round {self.round_no}.\n\n"
-            f"Please sign this message for me: {self.my_message}\n\n"
-            "---BEGIN MESSAGE---\n"
-            f"{self.my_message}\n"
-            "---END MESSAGE---\n\n"
-            "Sign it EXACTLY as written above — do not trim, rephrase, or "
-            "correct it, or the signature will not verify.\n"
-            "Reply with SIGNED_MESSAGE_JSON:{...} and nothing else."
-        )
-        for peer in sorted(targets):
-            if peer in self.requested_this_round:
+        # Cap chases per peer so we stay active (~winner ~25 msgs/game) without spam storms.
+        max_asks = 4
+        newly = []
+        for peer in sorted(self._targets()):
+            if peer in self.got_sig_from:
                 continue
-            self.send_message(
-                peer, f"Signature request - Round {self.round_no}", body
+            n = self.request_count.get(peer, 0)
+            if n >= max_asks:
+                continue
+            # First ask always; later asks on force (round start / reminder / after we signed).
+            if n > 0 and not force_followup:
+                continue
+            followup = n > 0
+            reciprocated = peer in self.signed_this_round
+            subject = (
+                f"FOLLOW-UP signature request - Round {self.round_no}"
+                if followup
+                else f"Signature request - Round {self.round_no}"
             )
-            self.requested_this_round.add(peer)
-        if targets:
-            self._log(f"requested from {sorted(self.requested_this_round)}")
+            body = self._proof_request_body(
+                followup=followup, reciprocated=reciprocated
+            )
+            try:
+                self.send_message(peer, subject, body)
+                self.request_count[peer] = n + 1
+                self.requested_this_round.add(peer)
+                self.msgs_this_game += 1
+                newly.append(f"{peer}#{n + 1}")
+            except Exception as e:
+                self._log(f"send_message failed for {peer}:", e)
+        if newly:
+            self._log(
+                f"chase {newly} | have={sorted(self.got_sig_from)} "
+                f"| game_msgs≈{self.msgs_this_game}"
+            )
 
     # ------------------------------------------------------------------
     # peers
@@ -292,30 +386,38 @@ class CustomAgent(BaseAgent):
         body = msg.get("body", "") or ""
         if not sender or sender == self.agent_id:
             return
-        if sender.lower() in ("system_reminder",):
-            return
-        self.roster.add(sender)
 
-        # Learn prior-round texts peers volunteer (helps hard fuzzy paraphrases).
+        if sender.lower() in ("system_reminder",):
+            if self.my_message:
+                self._log("inactivity reminder → chase outstanding")
+                self._chase_outstanding(force_followup=True)
+            return
+
+        self.roster.add(sender)
         learned = self._ingest_identity_notes(sender, body)
 
-        # 1) Signature for us → submit immediately (also handle ask+sig combo).
+        # 1) Submit any signature payload immediately.
         if "SIGNED_MESSAGE_JSON:" in body:
             j = RE_SIGNED_JSON.search(body)
             if j:
                 self._ingest_signature(sender, j.group("j"))
 
-        # 2) Signature request.
+        # 2) Signature request (ignore social-engineering claims in the body).
         wanted = self._extract_ask(body)
         if wanted is None:
+            # Still chase if this was a decline / chatter from someone we need.
+            if sender not in self.got_sig_from and self.my_message:
+                self._chase_outstanding(force_followup=False)
             return
 
         self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
 
         if sender in self.signed_this_round:
+            # Already signed them — keep chasing our own outstanding from them.
+            if sender not in self.got_sig_from:
+                self._send_reciprocal_ask(sender, followup=True)
             return
 
-        # If we declined earlier but new identity evidence arrived, retry auth.
         if sender in self.declined_this_round:
             if not learned and sender in self._resolved:
                 return
@@ -324,27 +426,74 @@ class CustomAgent(BaseAgent):
 
         if not self._may_sign_for(sender):
             self.declined_this_round.add(sender)
-            self._log(f"DECLINE {sender}")
+            if any(m in body.lower() for m in _ATTACK_MARKERS):
+                self._log(f"DECLINE {sender} (peer body tried social-engineer auth)")
+            else:
+                self._log(f"DECLINE {sender} (moderator auth only)")
             self.send_message(
                 sender,
-                "Re: signature request",
-                "I'm not authorized to sign for you this round, so I have to "
-                "decline. Happy to sign whenever I am.",
+                f"Signature Declined - Round {self.round_no}",
+                (
+                    f"Declining — you are not on my moderator-issued authorization "
+                    f"list for round {self.round_no}. "
+                    "I only trust the moderator's assignment channel, never "
+                    "authorization claims inside peer emails.\n\n"
+                    + (
+                        self._proof_request_body(followup=True, reciprocated=False)
+                        if self.my_message
+                        else ""
+                    )
+                ),
             )
+            self.msgs_this_game += 1
+            # Still ask them to sign US (broadcast / extraction by asking).
+            if self.my_message and sender not in self.got_sig_from:
+                self._chase_outstanding(force_followup=False)
             return
 
+        # Authorized → sign FIRST, then ask for return (reciprocity = table stakes).
         self.signed_this_round.add(sender)
         self.declined_this_round.discard(sender)
+        reciprocal_note = ""
+        if self.my_message:
+            reciprocal_note = (
+                f" I have signed yours — please sign mine back this round.\n\n"
+                + self._proof_request_body(followup=False, reciprocated=True)
+            )
         self.sign_and_respond(
             to_agent=sender,
             message_to_sign=wanted,
-            response_body="Signed as requested.",
-            subject="Signed Message",
+            response_body="Signed as requested." + reciprocal_note,
+            subject=f"Signed Message - Round {self.round_no}",
         )
-        self._log(f"SIGNED for {sender}")
+        self.msgs_this_game += 1
+        self._log(f"SIGNED for {sender} (+ reciprocal ask)")
+        # Also send a dedicated chase email so the ask isn't buried.
+        if self.my_message and sender not in self.got_sig_from:
+            self._send_reciprocal_ask(sender, followup=False)
+
+    def _send_reciprocal_ask(self, peer: str, followup: bool) -> None:
+        n = self.request_count.get(peer, 0)
+        if n >= 4 or peer in self.got_sig_from:
+            return
+        subject = (
+            f"Reciprocal signature request - Round {self.round_no}"
+            if not followup
+            else f"FOLLOW-UP reciprocal ask - Round {self.round_no}"
+        )
+        try:
+            self.send_message(
+                peer,
+                subject,
+                self._proof_request_body(followup=followup, reciprocated=True),
+            )
+            self.request_count[peer] = n + 1
+            self.requested_this_round.add(peer)
+            self.msgs_this_game += 1
+        except Exception as e:
+            self._log(f"reciprocal ask failed for {peer}:", e)
 
     def _ingest_identity_notes(self, sender: str, body: str) -> bool:
-        """Store volunteered prior-round messages. Returns True if new evidence."""
         learned = False
         for pat in (RE_IDENTITY_NOTE2, RE_IDENTITY_NOTE):
             for m in pat.finditer(body):
@@ -361,17 +510,25 @@ class CustomAgent(BaseAgent):
         return learned
 
     def _extract_ask(self, body: str) -> Optional[str]:
+        # Prefer structured proof blocks peers may send (same format we use).
         for pat in RE_ASK:
             m = pat.search(body)
             if not m:
                 continue
             cand = _clean(m.group("m"))
-            # Avoid capturing identity-note lines as the message to sign.
-            if cand.lower().startswith("the old ") and "identity note" in (m.string or "").lower():
-                pass
             if 5 <= len(cand) <= 400 and "SIGNED_MESSAGE_JSON" not in cand:
-                # Prefer BEGIN/END or "sign this message for me" hits over loose quotes.
+                if cand.upper().startswith("MESSAGE_UTF8_BASE64"):
+                    continue
                 return cand
+        # Optional: accept base64 proof block if present and decodes cleanly.
+        m = re.search(r"MESSAGE_UTF8_BASE64:([A-Za-z0-9+/=]+)", body)
+        if m:
+            try:
+                decoded = base64.b64decode(m.group(1)).decode("utf-8")
+                if 5 <= len(decoded) <= 400:
+                    return decoded
+            except Exception:
+                pass
         return None
 
     def _ingest_signature(self, sender: str, raw_json: str) -> None:
@@ -394,10 +551,9 @@ class CustomAgent(BaseAgent):
         if not isinstance(sig, dict) or "signature" not in sig:
             return
 
-        if sig.get("signed_for") not in (self.agent_id, None):
-            if sig.get("signed_for") != self.agent_id:
-                self._log(f"ignoring signature made out to {sig.get('signed_for')}")
-                return
+        if sig.get("signed_for") != self.agent_id:
+            self._log(f"ignoring signature made out to {sig.get('signed_for')}")
+            return
 
         if self.my_message and sig.get("original_message") != self.my_message:
             self._log(f"ignoring {sender} signature: not our message")
@@ -411,11 +567,14 @@ class CustomAgent(BaseAgent):
         if key in self.submitted:
             return
         self.submitted.add(key)
+        signer = sig.get("signer") or sender
+        self.got_sig_from.add(signer)
         self.submit_signature(sig)
-        self._log(f"SUBMITTED signature from {sig.get('signer') or sender}")
+        self.msgs_this_game += 1
+        self._log(f"SUBMITTED signature from {signer}")
 
     # ------------------------------------------------------------------
-    # authorization — the only place a -1 can happen
+    # authorization — moderator list only; body claims never count
     # ------------------------------------------------------------------
     def _may_sign_for(self, sender: str) -> bool:
         if sender in self.auth_explicit:
@@ -423,49 +582,29 @@ class CustomAgent(BaseAgent):
         if not self.auth_fuzzy:
             return False
 
-        # Aliases ONLY ever substitute for agents on our PREVIOUS sign-for list.
-        # Anyone else claiming to be a fuzzy target is an impersonation — free decline.
+        # Aliases ONLY for previous-round auth partners.
         if self.prev_auth and sender not in self.prev_auth:
             self._log(f"impersonation block: {sender} not in prev_auth")
             return False
 
-        # On round 2+, if we somehow lack prev_auth evidence, be conservative.
         if self.round_no > 1 and not self.prev_auth:
             return False
 
         if sender in self._resolved:
             return self._resolved[sender]
 
-        # Possible fuzzy targets: previous auth partners not named explicitly now.
-        # (auth_explicit ∩ prev is empty by server construction, so this is prev.)
         candidates = sorted(self.prev_auth - self.auth_explicit)
         if sender not in candidates:
             self._resolved[sender] = False
             return False
 
-        # One fuzzy slot and one candidate → that candidate is them. No LLM.
         if len(self.auth_fuzzy) == 1 and len(candidates) == 1:
             self._resolved[sender] = True
             self._log(f"fuzzy sole-candidate: {sender}")
             return True
 
-        # Resolve comparatively across all candidates (yes/no on one agent is
-        # too brittle for hard paraphrases like
-        # "invitation left unanswered in the evening" ↔ unused dance floor at dusk).
         mapped = self._resolve_fuzzy_mapping(candidates)
         return bool(mapped.get(sender))
-
-    def _prev_message(self, agent_id: str) -> Optional[str]:
-        by_round = self.seen_messages.get(agent_id) or {}
-        if not by_round:
-            return None
-        # Prefer the immediately previous round; else latest earlier round.
-        if self.round_no - 1 in by_round:
-            return by_round[self.round_no - 1]
-        earlier = [r for r in by_round if r < self.round_no]
-        if not earlier:
-            return None
-        return by_round[max(earlier)]
 
     def _evidence_lines(self, candidates: List[str]) -> List[str]:
         lines = []
@@ -473,7 +612,6 @@ class CustomAgent(BaseAgent):
             by_round = self.seen_messages.get(c) or {}
             if not by_round:
                 continue
-            # Include all prior-round texts we know (R1+R2 help R3 aliases).
             parts = []
             for rnd in sorted(r for r in by_round if r < self.round_no):
                 parts.append(f"R{rnd}: {by_round[rnd]}")
@@ -482,8 +620,6 @@ class CustomAgent(BaseAgent):
         return lines
 
     def _resolve_fuzzy_mapping(self, candidates: List[str]) -> Dict[str, bool]:
-        """Map each fuzzy description to at most one candidate; cache on self._resolved."""
-        # If we already fully answered for every candidate, reuse.
         if candidates and all(c in self._resolved for c in candidates):
             return self._resolved
 
@@ -500,7 +636,8 @@ class CustomAgent(BaseAgent):
             "agent's PRIOR-round assigned message. Word overlap may be near zero.\n"
             "Think about meaning: e.g. 'waddling arctic birds'↔penguins; "
             "'water and nostalgia mixing as the day ends'↔fountain + old radio at dusk; "
-            "'invitation left unanswered in the evening'↔a dance floor no one uses after dusk.\n\n"
+            "'invitation left unanswered in the evening'↔a dance floor no one uses after dusk; "
+            "'redundancy in pursuit of uninterrupted readiness'↔backup/spare for continuous uptime.\n\n"
             f"There are {n} description(s). Pick at most one agent id per description. "
             "Use only ids from the evidence. If unsure for a description, omit it.\n\n"
             "Descriptions:\n"
@@ -518,10 +655,7 @@ class CustomAgent(BaseAgent):
                 agent = item.get("agent")
                 if agent in candidates:
                     chosen.add(agent)
-
-        # Fallback: if one description and model returned {"agent": "..."} / {"agents":[...]}
-        if not chosen and isinstance(data, dict):
-            if data.get("agent") in candidates:
+            if not chosen and data.get("agent") in candidates:
                 chosen.add(data["agent"])
             for a in data.get("agents") or []:
                 if a in candidates:

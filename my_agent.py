@@ -230,6 +230,7 @@ class CustomAgent(BaseAgent):
         self._asked_this_batch: Set[str] = set()
         self._pending_asks: List[Dict[str, Any]] = []
         self._pending_short_asks: List[str] = []
+        self._prior_false: Set[str] = set()
 
     def _log(self, *a: Any) -> None:
         print(f"[{getattr(self, 'agent_id', '?')}]", *a, flush=True)
@@ -326,8 +327,16 @@ class CustomAgent(BaseAgent):
                 for c in (getattr(self, "fuzzy_candidates", set()) or ())
                 if self._resolved.get(c) is not False
             }
+            # Keep False-resolved agents for one-round re-expand if sole-candidate
+            # fails a meaning check (wrong False purge caused the mitten cascade).
+            self._prior_false = {
+                a for a, ok in self._resolved.items() if ok is False
+            }
             self.prev_auth = known
-            self._log(f"prev_auth ← {sorted(known)} (excluded resolved-False)")
+            self._log(
+                f"prev_auth ← {sorted(known)} "
+                f"(excluded False={sorted(self._prior_false)})"
+            )
             self._update_cross_round_priors()
 
         self.round_no = new_round
@@ -349,6 +358,8 @@ class CustomAgent(BaseAgent):
         self._pending_asks = []
         self._pending_short_asks = []
         self.contacted_this_round = set()
+        if not hasattr(self, "_prior_false"):
+            self._prior_false = set()
 
         m = RE_ASSIGNED.search(body)
         if not m:
@@ -1142,12 +1153,19 @@ class CustomAgent(BaseAgent):
         if not self.auth_fuzzy:
             return False
 
-        # Aliases ONLY for previous-round auth partners.
-        if self.prev_auth and sender not in self.prev_auth:
+        prior_false = getattr(self, "_prior_false", set()) or set()
+
+        # Aliases ONLY for previous-round auth partners — but allow one-round
+        # re-entry for peers we marked False (may have been a wrong purge).
+        if (
+            self.prev_auth
+            and sender not in self.prev_auth
+            and sender not in prior_false
+        ):
             self._log(f"impersonation block: {sender} not in prev_auth")
             return False
 
-        if self.round_no > 1 and not self.prev_auth:
+        if self.round_no > 1 and not self.prev_auth and sender not in prior_false:
             return False
 
         # Positive cache only — never trust a cached False from a failed map.
@@ -1160,7 +1178,9 @@ class CustomAgent(BaseAgent):
 
         candidates = sorted(self.prev_auth - self.auth_explicit)
         self.fuzzy_candidates = set(candidates)
-        if sender not in candidates:
+        # Allow re-expand pool for matching even if sender was wrongly purged.
+        expand = set(candidates) | (prior_false - self.auth_explicit)
+        if sender not in expand:
             return False
 
         # N fuzzy slots replace exactly those N prev-auth agents → all authorized.
@@ -1172,10 +1192,25 @@ class CustomAgent(BaseAgent):
             return True
 
         if len(self.auth_fuzzy) == 1 and len(candidates) == 1:
-            self._resolved[sender] = True
-            self.declined_this_round.discard(sender)
-            self._log(f"fuzzy sole-candidate: {sender}")
-            return True
+            only = candidates[0]
+            if self._description_fits(self.auth_fuzzy[0], only):
+                self._resolved[only] = True
+                self.declined_this_round.discard(only)
+                self._log(f"fuzzy sole-candidate (fit): {only}")
+                return only == sender
+            # Wrong purge / bad sole — re-expand and match properly.
+            self._log(
+                f"fuzzy sole-candidate REJECT {only} "
+                f"(paraphrase does not fit) — re-expanding"
+            )
+            candidates = sorted(expand)
+            self.fuzzy_candidates = set(candidates)
+            if self.auth_fuzzy and len(self.auth_fuzzy) == len(candidates):
+                for c in candidates:
+                    self._resolved[c] = True
+                    self.declined_this_round.discard(c)
+                self._log(f"fuzzy bijection after re-expand: {candidates}")
+                return sender in candidates
 
         evidenced = [
             c for c in candidates
@@ -1183,14 +1218,39 @@ class CustomAgent(BaseAgent):
         ]
         if len(self.auth_fuzzy) == 1 and len(evidenced) == 1:
             only = evidenced[0]
-            for c in candidates:
-                self._resolved[c] = c == only
-            self.declined_this_round.discard(only)
-            self._log(f"fuzzy sole-evidence: {only}")
-            return bool(self._resolved.get(sender))
+            if self._description_fits(self.auth_fuzzy[0], only):
+                self._resolved[only] = True
+                self.declined_this_round.discard(only)
+                self._log(f"fuzzy sole-evidence (fit): {only}")
+                return only == sender
+            self._log(f"fuzzy sole-evidence REJECT {only} — falling through")
 
-        mapped = self._resolve_fuzzy_mapping(candidates)
+        # Prefer expanded pool when matching so a wrong prior False can recover.
+        mapped = self._resolve_fuzzy_mapping(sorted(expand))
         return bool(mapped.get(sender))
+
+    def _description_fits(self, description: str, agent: str) -> bool:
+        """Require positive meaning overlap before sole-candidate/evidence auth.
+
+        Without this, a wrong False purge leaves one leftover peer who is
+        auto-authorized even when the paraphrase clearly belongs to someone else
+        (Match #18: sole-candidate oluwasegun for raffi's radiator mittens).
+        """
+        prior = self._prev_round_message(agent)
+        if not prior:
+            return False
+        scores = self._heuristic_fuzzy_scores(description, [agent])
+        if not scores or scores[0][1] < 2.0:
+            return False
+        desc = self._token_set(description)
+        msg = self._token_set(prior)
+        # Domain anchors: paraphrase heat/warmth must map to heat in the prior
+        # (mittens-on-radiator beats mittens-on-traffic-signs).
+        heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
+        heat_msg = msg & {"heater", "heat", "warmth", "warm", "radiator", "warming"}
+        if heat_desc and not heat_msg:
+            return False
+        return True
 
     def _prev_round_message(self, agent_id: str) -> Optional[str]:
         by_round = self.seen_messages.get(agent_id) or {}
@@ -1290,6 +1350,15 @@ class CustomAgent(BaseAgent):
             # quiet space outdone by defective silence ↔ theater seats squeak except broken
             ({"quiet", "space", "outdone", "defective", "silence"},
              {"theater", "theatre", "seat", "seats", "squeaked", "squeak", "broken", "movie"}),
+            # forgotten warmth waiting atop a heater ↔ mittens left on a radiator
+            # (NOT mittens on traffic signs — those lack heat/warmth cues)
+            ({"forgotten", "warmth", "waiting", "atop", "heater", "heat", "warm"},
+             {"mittens", "mitten", "radiator", "heater", "heat", "warming", "warm",
+              "gloves", "glove"}),
+            # anonymous / unsigned art ↔ gallery paintings without a signature
+            ({"anonymous", "unsigned", "art", "paintings", "gallery", "artist"},
+             {"unsigned", "paintings", "painting", "gallery", "anonymous", "artist",
+              "art", "signature"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {
@@ -1307,7 +1376,14 @@ class CustomAgent(BaseAgent):
             "tune": {"whistling", "whistle", "anthem", "song"},
             "reclaiming": {"bloom", "daffodils", "tracks"},
             "silence": {"squeak", "squeaked", "quiet", "broken"},
+            "warmth": {"mittens", "mitten", "radiator", "heater", "heat", "warm", "gloves"},
+            "heater": {"radiator", "heat", "warm", "mittens", "mitten"},
+            "atop": {"on", "top", "radiator", "heater"},
+            "forgotten": {"left", "mittens", "mitten", "still"},
+            "anonymous": {"unsigned", "paintings", "painting", "gallery"},
+            "unsigned": {"paintings", "painting", "gallery", "anonymous"},
         }
+        heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []
         for c in candidates:
             msg = (self._prev_round_message(c) or "").lower()
@@ -1325,7 +1401,13 @@ class CustomAgent(BaseAgent):
                     hit = words & linked
                     if hit:
                         bonus += 1.5 + 0.5 * len(hit)
-            scores.append((c, overlap + bonus))
+            total = overlap + bonus
+            # Kill near-misses: "mittens on traffic signs" must not beat
+            # "mittens on radiator" for a warmth/heater paraphrase.
+            heat_msg = words & {"heater", "heat", "warmth", "warm", "radiator", "warming"}
+            if heat_desc and not heat_msg:
+                total *= 0.25
+            scores.append((c, total))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
 
@@ -1479,9 +1561,11 @@ class CustomAgent(BaseAgent):
                 c for c in candidates
                 if any(r < self.round_no for r in (self.seen_messages.get(c) or {}))
             ]
-            if len(evidenced) == 1:
+            if len(evidenced) == 1 and self._description_fits(
+                self.auth_fuzzy[0], evidenced[0]
+            ):
                 chosen.add(evidenced[0])
-                self._log(f"fuzzy fallback sole-evidence: {evidenced[0]}")
+                self._log(f"fuzzy fallback sole-evidence (fit): {evidenced[0]}")
             else:
                 # Heuristic scores → same threshold gate (scaled to ~0-100-ish).
                 raw = self._heuristic_fuzzy_scores(self.auth_fuzzy[0], candidates)
@@ -1494,11 +1578,16 @@ class CustomAgent(BaseAgent):
                         self._log(f"fuzzy heuristic → {pick}")
 
         if chosen:
-            for c in candidates:
-                self._resolved[c] = c in chosen
+            # Mark winners True; only mark losers False when every fuzzy slot is
+            # filled — partial maps must not purge the true alias for next round.
             for c in chosen:
+                self._resolved[c] = True
                 self.declined_this_round.discard(c)
                 self._log(f"fuzzy mapped -> {c}")
+            if len(chosen) >= len(self.auth_fuzzy):
+                for c in candidates:
+                    if c not in chosen:
+                        self._resolved[c] = False
         else:
             self._log(
                 f"fuzzy unresolved among {candidates}; declining this ask (no cache)"

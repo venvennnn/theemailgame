@@ -664,11 +664,10 @@ class CustomAgent(BaseAgent):
             if peer not in ordered:
                 ordered.append(peer)
 
-        # Re-nudge known deadbeats we signed this round: submit our provide.
+        # Re-nudge anyone we signed this round whose provide may be unsubmitted.
         if force_followup:
             for peer in sorted(signed):
-                if self.deadbeat_counts.get(peer, 0) >= 1:
-                    self._send_submit_reminder(peer, force=True)
+                self._send_submit_reminder(peer, force=True)
 
         newly = []
         batch = int(getattr(self, "_batch_seq", 0))
@@ -1503,6 +1502,17 @@ class CustomAgent(BaseAgent):
             ({"rivalry", "fueled", "care", "shared", "greenery", "green"},
              {"siblings", "fought", "fight", "water", "watering", "ficus", "plant",
               "tree", "garden"}),
+            # comfort provided in advance of occupancy ↔ warm theater seats before anyone arrives
+            ({"comfort", "provided", "advance", "occupancy", "before", "arrives"},
+             {"theater", "theatre", "seats", "seat", "warm", "before", "anyone",
+              "arrives", "arrival"}),
+            # restraint discarded, bearer moved on ↔ leash dangling on park bench, nobody nearby
+            ({"restraint", "discarded", "bearer", "moved", "implying", "abandoned"},
+             {"leash", "dangled", "dangling", "park", "bench", "nobody", "nearby",
+              "left"}),
+            # unexpected discoveries following wet weather ↔ marble in sandbox after rain
+            ({"unexpected", "discoveries", "persistently", "following", "wet", "weather"},
+             {"marble", "sandbox", "rain", "rains", "children", "find", "after"}),
             # broken umbrella posted through every mailbox after storm
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
@@ -1543,6 +1553,15 @@ class CustomAgent(BaseAgent):
             "greenery": {"ficus", "plant", "tree", "garden", "water", "watering"},
             "shared": {"siblings", "ficus", "water"},
             "care": {"water", "watering", "ficus", "plant"},
+            "comfort": {"warm", "seats", "seat", "theater", "theatre"},
+            "occupancy": {"arrives", "anyone", "seats", "before"},
+            "advance": {"before", "warm", "seats"},
+            "restraint": {"leash", "bench", "park"},
+            "discarded": {"dangled", "dangling", "left", "nobody", "leash"},
+            "bearer": {"nobody", "nearby", "leash"},
+            "discoveries": {"marble", "find", "sandbox"},
+            "wet": {"rain", "rains", "sandbox"},
+            "weather": {"rain", "rains"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []

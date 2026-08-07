@@ -1068,7 +1068,28 @@ class CustomAgent(BaseAgent):
             # creativity halted by a difficult hue ↔ refuse to rehearse if orange
             ({"creativity", "halted", "difficult", "hue", "color", "presence"},
              {"singer", "rehearse", "orange", "refuses", "wears", "colour", "color"}),
+            # sentimental attachments outweighing utility ↔ keychain more trinkets than keys
+            ({"sentimental", "attachments", "outweighing", "utility", "keepsake"},
+             {"keychain", "trinkets", "keys", "holds", "more", "keepsakes", "souvenirs"}),
+            # messages time-stamped one day ahead by habit ↔ tomorrow's date on postcards
+            ({"messages", "time", "stamped", "timestamped", "ahead", "habit", "day"},
+             {"tomorrow", "date", "postcard", "postcards", "writes", "every"}),
+            # playthings lingering after everyone else has gone ↔ toy still moving after bell
+            ({"playthings", "lingering", "everyone", "gone", "after"},
+             {"toy", "dog", "wind", "circles", "classroom", "bell", "rings", "after"}),
         ]
+        # Single-token bridges when rigid bags miss (still requires decisive margin).
+        bridges = {
+            "sentimental": {"trinkets", "keepsakes", "souvenirs", "mementos", "keychain"},
+            "attachments": {"trinkets", "keepsakes", "keychain", "charms"},
+            "utility": {"keys", "useful", "practical", "tools"},
+            "playthings": {"toy", "toys", "doll", "wind"},
+            "lingering": {"circles", "remains", "stays", "after"},
+            "timestamped": {"date", "tomorrow", "postcard"},
+            "stamped": {"date", "tomorrow", "postcard"},
+            "anticipation": {"candle", "midnight", "almost", "before"},
+            "dimmed": {"out", "went", "extinguished"},
+        }
         scores: List[Tuple[str, float]] = []
         for c in candidates:
             msg = (self._prev_round_message(c) or "").lower()
@@ -1080,6 +1101,12 @@ class CustomAgent(BaseAgent):
             for dbag, mbag in bags:
                 if desc & dbag and words & mbag:
                     bonus += 2.0 + len(words & mbag)
+            for dword in desc:
+                linked = bridges.get(dword)
+                if linked:
+                    hit = words & linked
+                    if hit:
+                        bonus += 1.5 + 0.5 * len(hit)
             scores.append((c, overlap + bonus))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores

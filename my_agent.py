@@ -178,6 +178,8 @@ class CustomAgent(BaseAgent):
                 self.deadbeat_counts = {}
             if not hasattr(self, "message_owners"):
                 self.message_owners = {}
+            if not hasattr(self, "silent_rounds"):
+                self.silent_rounds = {}
             if not hasattr(self, "_batch_seq"):
                 self._batch_seq = 0
             if not hasattr(self, "_sent_kinds"):
@@ -211,7 +213,10 @@ class CustomAgent(BaseAgent):
         # Soft priors across rounds (never hard-ban; auth changes each round).
         self.refusal_counts: Dict[str, int] = {}
         self.deadbeat_counts: Dict[str, int] = {}
+        # Peers with a full silent round → cap at 1 outbound ask next rounds.
+        self.silent_rounds: Dict[str, int] = {}
         self.alive_this_round: Set[str] = set()
+        self.contacted_this_round: Set[str] = set()
         self.submit_nudged: Set[str] = set()
         self._resolved: Dict[str, bool] = {}
         self.fuzzy_candidates: Set[str] = set()
@@ -219,9 +224,10 @@ class CustomAgent(BaseAgent):
         self._identity_broadcast_done = False
         self._batch_seq: int = 0
         self.msgs_this_game: int = 0
-        # First claimant of a message text wins; replayers are quarantined.
-        self.message_owners: Dict[str, Set[str]] = {}
+        # (round, normalized message) -> claimants. Never includes us.
+        self.message_owners: Dict[Tuple[int, str], Set[str]] = {}
         self._sent_kinds: Set[Tuple[str, str]] = set()
+        self._asked_this_batch: Set[str] = set()
         self._pending_asks: List[Dict[str, Any]] = []
         self._pending_short_asks: List[str] = []
 
@@ -238,6 +244,7 @@ class CustomAgent(BaseAgent):
         self._batch_seq = int(getattr(self, "_batch_seq", 0)) + 1
         self._pending_asks = []
         self._pending_short_asks = []
+        self._asked_this_batch = set()
         force_chase = False
 
         mod = [m for m in messages if self._is_moderator(m)]
@@ -331,8 +338,10 @@ class CustomAgent(BaseAgent):
         self._fuzzy_attempted = False
         self._identity_broadcast_done = False
         self._sent_kinds = set()
+        self._asked_this_batch = set()
         self._pending_asks = []
         self._pending_short_asks = []
+        self.contacted_this_round = set()
 
         m = RE_ASSIGNED.search(body)
         if not m:
@@ -377,7 +386,7 @@ class CustomAgent(BaseAgent):
             f"deadbeat={dict(getattr(self, 'deadbeat_counts', {}))}"
         )
         self._broadcast_identity()
-        self._offer_signing_capacity()
+        # Offer-to-sign is merged into the first chase ask (never quote a placeholder).
         self._chase_outstanding(force_followup=True)
 
     @staticmethod
@@ -463,12 +472,15 @@ class CustomAgent(BaseAgent):
             f"PRIOR_MESSAGE_JSON:{prior_json}"
         )
         for peer in recipients:
+            if self.silent_rounds.get(peer, 0) >= 1:
+                continue  # dead peers: skip identity, keep the one allowed ask elsewhere
             try:
                 self.send_message(
                     peer,
                     f"Identity note - Round {self.round_no}",
                     body,
                 )
+                self.contacted_this_round.add(peer)
                 self.msgs_this_game += 1
             except Exception as e:
                 self._log(f"identity broadcast failed for {peer}:", e)
@@ -476,7 +488,7 @@ class CustomAgent(BaseAgent):
             self._log(f"identity broadcast → {recipients} (R{prev_r}={prev!r})")
 
     def _update_cross_round_priors(self) -> None:
-        """End-of-round: mark deadbeats (took our sig, never signed back)."""
+        """End-of-round: mark deadbeats + fully silent peers."""
         for peer in set(self.signed_this_round):
             if peer in self.got_sig_from:
                 self.deadbeat_counts.pop(peer, None)
@@ -486,18 +498,37 @@ class CustomAgent(BaseAgent):
                     f"deadbeat prior {peer} → {self.deadbeat_counts[peer]} "
                     "(signed them, no reciprocal)"
                 )
+        for peer in set(getattr(self, "contacted_this_round", set()) or ()):
+            if peer in self.alive_this_round or peer in self.got_sig_from:
+                self.silent_rounds.pop(peer, None)
+            else:
+                self.silent_rounds[peer] = self.silent_rounds.get(peer, 0) + 1
+                self._log(
+                    f"silent prior {peer} → {self.silent_rounds[peer]} "
+                    "(contacted, zero inbound)"
+                )
 
     def _max_asks_for(self, peer: str) -> int:
-        """Soft priors: fewer asks for chronic refusers / deadbeats unless they engage."""
+        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers."""
         max_asks = DEFAULT_MAX_ASKS
         alive = peer in getattr(self, "alive_this_round", set())
         if not alive and self.refusal_counts.get(peer, 0) >= 1:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
         if self.deadbeat_counts.get(peer, 0) >= 1:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
+        if self.silent_rounds.get(peer, 0) >= 1:
+            max_asks = min(max_asks, 1)
         return max_asks
 
-    def _proof_request_body(self, *, followup: bool, reciprocated: bool) -> str:
+    def _authorized_partners(self) -> Set[str]:
+        partners = set(self.auth_explicit)
+        partners |= {a for a, ok in self._resolved.items() if ok}
+        partners.discard(self.agent_id)
+        return partners
+
+    def _proof_request_body(
+        self, *, followup: bool, reciprocated: bool, offer: bool = False
+    ) -> str:
         msg = self.my_message
         b64 = _b64(msg)
         parts = [
@@ -516,6 +547,13 @@ class CustomAgent(BaseAgent):
             f"Please sign this message for me: {msg}",
             "Reply with SIGNED_MESSAGE_JSON:{...} and nothing else. Do not trim or rephrase.",
         ]
+        if offer:
+            parts.insert(
+                1,
+                "I am authorized to sign for you this round — send me your EXACT "
+                "assigned message and I will sign immediately. Please submit my "
+                "signature to the moderator so we both score.",
+            )
         if reciprocated:
             parts.insert(
                 1,
@@ -534,39 +572,26 @@ class CustomAgent(BaseAgent):
             parts.append(trailer)
         return "\n".join(parts)
 
-    def _authorized_partners(self) -> Set[str]:
-        partners = set(self.auth_explicit)
-        partners |= {a for a, ok in self._resolved.items() if ok}
-        partners.discard(self.agent_id)
-        return partners
+    def _ask_send_allowed(self, peer: str) -> bool:
+        """One ask-family send per peer per batch; re-check got_sig_from at send time."""
+        if not self.my_message or peer == self.agent_id:
+            return False
+        if peer in self.got_sig_from or peer in self.refused_us:
+            return False
+        if peer in getattr(self, "_asked_this_batch", set()):
+            return False
+        n = self.request_count.get(peer, 0)
+        if n >= self._max_asks_for(peer):
+            return False
+        return True
 
-    def _offer_signing_capacity(self) -> None:
-        """Tell authorized peers we can sign them now — don't wait for them to ask.
-
-        Speeds reciprocity: they send their message sooner, we sign, they submit.
-        Still sign deadbeats if they ask (+1 provide), but don't spend offer emails on them.
-        """
-        for peer in sorted(self._authorized_partners()):
-            if peer in self.signed_this_round:
-                continue
-            if self.deadbeat_counts.get(peer, 0) >= 1:
-                continue
-            try:
-                self.send_message(
-                    peer,
-                    f"I can sign for you - Round {self.round_no}",
-                    (
-                        f"Hi {peer}, I am authorized to sign for you this round "
-                        f"(moderator assignment). Send me your EXACT assigned message "
-                        f'as: Please sign this message for me: "<your message>"\n'
-                        "I will sign_and_respond immediately. "
-                        "Please submit my signature to the moderator so we both score."
-                    ),
-                )
-                self.msgs_this_game += 1
-                self._log(f"offer-to-sign → {peer}")
-            except Exception as e:
-                self._log(f"offer-to-sign failed for {peer}:", e)
+    def _mark_ask_sent(self, peer: str) -> None:
+        self._asked_this_batch.add(peer)
+        self.request_count[peer] = self.request_count.get(peer, 0) + 1
+        self.last_ask_batch[peer] = int(getattr(self, "_batch_seq", 0))
+        self.requested_this_round.add(peer)
+        self.contacted_this_round.add(peer)
+        self.msgs_this_game += 1
 
     def _chase_outstanding(self, force_followup: bool = False) -> None:
         """Ask / re-ask peers who have not yet signed our assigned message."""
@@ -590,25 +615,23 @@ class CustomAgent(BaseAgent):
 
         newly = []
         batch = int(getattr(self, "_batch_seq", 0))
+        authorized = self._authorized_partners()
         for peer in ordered:
-            if peer in self.got_sig_from or peer in self.refused_us:
+            if not self._ask_send_allowed(peer):
                 continue
             n = self.request_count.get(peer, 0)
-            max_asks = self._max_asks_for(peer)
-            if n >= max_asks:
-                continue
             if n > 0 and not force_followup:
-                # Mid-round escalation: request-list peers get follow-ups after N batches.
                 last = self.last_ask_batch.get(peer, 0)
                 on_req = peer in self.request_list
                 if not on_req or (batch - last) < FOLLOWUP_AFTER_BATCHES:
                     continue
             followup = n > 0
             reciprocated = peer in self.signed_this_round
+            offer = (not followup) and peer in authorized and peer not in self.signed_this_round
             # On follow-up, prefer short ask (converts better vs picky agents).
             if followup and n % 2 == 1:
-                self._send_short_ask(peer)
-                newly.append(f"{peer}#{n + 1}s")
+                if self._send_short_ask(peer, offer=False):
+                    newly.append(f"{peer}#{n + 1}s")
                 continue
             subject = (
                 f"FOLLOW-UP signature request - Round {self.round_no}"
@@ -616,15 +639,14 @@ class CustomAgent(BaseAgent):
                 else f"Signature request - Round {self.round_no}"
             )
             body = self._proof_request_body(
-                followup=followup, reciprocated=reciprocated
+                followup=followup, reciprocated=reciprocated, offer=offer
             )
             try:
+                if not self._ask_send_allowed(peer):
+                    continue
                 self.send_message(peer, subject, body)
-                self.request_count[peer] = n + 1
-                self.last_ask_batch[peer] = batch
-                self.requested_this_round.add(peer)
-                self.msgs_this_game += 1
-                newly.append(f"{peer}#{n + 1}")
+                self._mark_ask_sent(peer)
+                newly.append(f"{peer}#{n + 1}" + ("o" if offer else ""))
             except Exception as e:
                 self._log(f"send_message failed for {peer}:", e)
         if newly:
@@ -813,80 +835,92 @@ class CustomAgent(BaseAgent):
         )
         return any(n in low for n in needles)
 
-    def _send_reciprocal_ask(self, peer: str, followup: bool) -> None:
-        if peer in self.refused_us:
-            return
+    def _send_reciprocal_ask(self, peer: str, followup: bool) -> bool:
+        if not self._ask_send_allowed(peer):
+            return False
         n = self.request_count.get(peer, 0)
-        if n >= self._max_asks_for(peer) or peer in self.got_sig_from:
-            return
         # Alternate: short ask often converts better than the proof wall.
         if n % 2 == 1:
-            self._send_short_ask(peer)
-            return
+            return self._send_short_ask(peer, offer=False)
         subject = (
             f"Reciprocal signature request - Round {self.round_no}"
             if not followup
             else f"FOLLOW-UP reciprocal ask - Round {self.round_no}"
         )
         try:
+            if not self._ask_send_allowed(peer):
+                return False
             self.send_message(
                 peer,
                 subject,
                 self._proof_request_body(followup=followup, reciprocated=True),
             )
-            self.request_count[peer] = n + 1
-            self.last_ask_batch[peer] = int(getattr(self, "_batch_seq", 0))
-            self.requested_this_round.add(peer)
-            self.msgs_this_game += 1
+            self._mark_ask_sent(peer)
+            return True
         except Exception as e:
             self._log(f"reciprocal ask failed for {peer}:", e)
+            return False
 
-    def _send_short_ask(self, peer: str) -> None:
-        """Minimal request — some agents auto-decline long/proof-heavy mails."""
-        if not self.my_message or peer in self.got_sig_from or peer in self.refused_us:
-            return
-        n = self.request_count.get(peer, 0)
-        if n >= self._max_asks_for(peer):
-            return
-        body = (
-            f"Hi {peer}, please sign this message for me: {self.my_message}\n\n"
-            f'Exact text: "{self.my_message}"\n'
-            "Reply with SIGNED_MESSAGE_JSON:{...} only."
-            f"{self._identity_trailer()}"
-        )
+    def _send_short_ask(self, peer: str, offer: bool = False) -> bool:
+        """Minimal request — only quote our real assigned text (no placeholders)."""
+        if not self._ask_send_allowed(peer):
+            return False
+        msg = self.my_message
+        parts = [
+            f"Hi {peer}, please sign this message for me: {msg}",
+            "",
+            f'Exact text: "{msg}"',
+            f"MESSAGE_UTF8_BASE64:{_b64(msg)}",
+            "Reply with SIGNED_MESSAGE_JSON:{...} only.",
+        ]
+        if offer:
+            parts.insert(
+                0,
+                "I am authorized to sign for you this round — send your EXACT "
+                "assigned message and I will sign immediately.",
+            )
+            parts.insert(1, "")
+        trailer = self._identity_trailer()
+        if trailer:
+            parts.append(trailer.lstrip("\n") if parts else trailer)
+        body = "\n".join(parts)
         try:
+            if not self._ask_send_allowed(peer):
+                return False
             self.send_message(
                 peer,
                 f"Please sign - Round {self.round_no}",
                 body,
             )
-            self.request_count[peer] = n + 1
-            self.last_ask_batch[peer] = int(getattr(self, "_batch_seq", 0))
-            self.requested_this_round.add(peer)
-            self.msgs_this_game += 1
-            self._log(f"short-ask → {peer}#{n + 1}")
+            self._mark_ask_sent(peer)
+            self._log(f"short-ask → {peer}#{self.request_count.get(peer, 0)}")
+            return True
         except Exception as e:
             self._log(f"short-ask failed for {peer}:", e)
+            return False
 
     @staticmethod
     def _norm_msg(text: str) -> str:
         return (text or "").strip().lower()
 
-    def _is_our_message(self, text: str) -> bool:
-        key = self._norm_msg(text)
-        return key in {
-            self._norm_msg(m) for m in (getattr(self, "my_message_history", {}) or {}).values()
-        }
+    def _is_our_message_at(self, text: str, rnd_i: int) -> bool:
+        """True only if text equals OUR assigned message for that same round."""
+        ours = (getattr(self, "my_message_history", {}) or {}).get(rnd_i)
+        return bool(ours) and self._norm_msg(ours) == self._norm_msg(text)
 
     def _record_ask_evidence(self, agent: str, rnd_i: int, message: str) -> bool:
-        """Store ask text as evidence; quarantine replays of others'/our messages."""
+        """Store ask text as evidence; quarantine same-round replays. Key=(round,text)."""
         msg = _clean(message)
-        if not msg:
+        if not msg or agent == self.agent_id:
             return False
-        key = self._norm_msg(msg)
-        if self._is_our_message(msg):
-            self._log(f"POISON: {agent} R{rnd_i} replaying OUR message — not stored")
+        if self._is_our_message_at(msg, rnd_i):
+            self._log(f"POISON: {agent} R{rnd_i} replaying OUR R{rnd_i} message — not stored")
             return False
+        # Placeholder / junk asks from quote-grabbers.
+        if self._norm_msg(msg) in {"<your message>", "your message", "agent", self.agent_id}:
+            self._log(f"POISON: {agent} R{rnd_i} junk ask {msg!r} — not stored")
+            return False
+        key = (rnd_i, self._norm_msg(msg))
         owners = self.message_owners.setdefault(key, set())
         if owners and agent not in owners:
             self._log(
@@ -904,12 +938,12 @@ class CustomAgent(BaseAgent):
     ) -> bool:
         """Fill gaps only — never overwrite ask evidence or accept poisoned claims."""
         msg = _clean(msg)
-        if not msg:
+        if not msg or agent == self.agent_id:
             return False
-        if self._is_our_message(msg):
-            self._log(f"{source} ignored (OUR message) {agent} R{rnd_i}: {msg!r}")
+        if self._is_our_message_at(msg, rnd_i):
+            self._log(f"{source} ignored (OUR R{rnd_i} message) {agent}: {msg!r}")
             return False
-        key = self._norm_msg(msg)
+        key = (rnd_i, self._norm_msg(msg))
         owners = self.message_owners.setdefault(key, set())
         if owners and agent not in owners:
             self._log(
@@ -1066,8 +1100,15 @@ class CustomAgent(BaseAgent):
             self._log(f"ignoring signature made out to {sig.get('signed_for')}")
             return
 
-        if self.my_message and sig.get("original_message") != self.my_message:
-            self._log(f"ignoring {sender} signature: not our message")
+        original = sig.get("original_message")
+        if self.my_message and original != self.my_message:
+            self._log(f"ignoring {sender} signature: not our message ({original!r})")
+            return
+        # Quote-grabber junk (fed by old placeholder templates, etc.).
+        if self._norm_msg(str(original or "")) in {
+            "<your message>", "your message", "agent", self.agent_id.lower()
+        }:
+            self._log(f"ignoring {sender} junk signature on {original!r}")
             return
 
         key = (

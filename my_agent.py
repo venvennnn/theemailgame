@@ -145,6 +145,28 @@ def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
+def _is_junk_ask(text: str) -> bool:
+    """True for unfilled template placeholders (Phaj '{assigned_message}' etc.)."""
+    msg = (text or "").strip()
+    if not msg:
+        return True
+    low = msg.lower()
+    if "{" in msg or "}" in msg:
+        return True
+    if low in {
+        "<your message>",
+        "your message",
+        "agent",
+        "{assigned_message}",
+        "{agent_id}",
+        "'{assigned_message}'",
+    }:
+        return True
+    if "assigned_message" in low or "agent_id" in low:
+        return True
+    return False
+
+
 class CustomAgent(BaseAgent):
     """Proof + workhorse chase + reciprocity + moderator-only auth."""
 
@@ -821,6 +843,25 @@ class CustomAgent(BaseAgent):
                 self._send_short_ask(sender)
             return
 
+        # Authorized but they sent an unfilled template — do NOT sign junk
+        # (Match #21: signed literal '{assigned_message}' for abdulsamad).
+        if _is_junk_ask(wanted):
+            if ("junk_ask", sender) not in self._sent_kinds:
+                self._sent_kinds.add(("junk_ask", sender))
+                self._log(f"REFUSE junk ask from {sender}: {wanted!r}")
+                self.send_message(
+                    sender,
+                    f"Need your exact message - Round {self.round_no}",
+                    (
+                        "I am authorized to sign for you, but your ask looked like an "
+                        "unfilled template (e.g. {assigned_message}). "
+                        "Resend your EXACT moderator-assigned message in the form:\n"
+                        "Please sign this message for me: <your exact text>"
+                    ),
+                )
+                self.msgs_this_game += 1
+            return
+
         if ("sign", sender) in self._sent_kinds:
             return
         self._sent_kinds.add(("sign", sender))
@@ -1018,8 +1059,8 @@ class CustomAgent(BaseAgent):
         if self._is_our_message_at(msg, rnd_i):
             self._log(f"POISON: {agent} R{rnd_i} replaying OUR R{rnd_i} message — not stored")
             return False
-        # Placeholder / junk asks from quote-grabbers.
-        if self._norm_msg(msg) in {"<your message>", "your message", "agent", self.agent_id}:
+        # Placeholder / junk asks from quote-grabbers / broken templates.
+        if _is_junk_ask(msg) or self._norm_msg(msg) == self.agent_id:
             self._log(f"POISON: {agent} R{rnd_i} junk ask {msg!r} — not stored")
             return False
         key = (rnd_i, self._norm_msg(msg))
@@ -1454,6 +1495,10 @@ class CustomAgent(BaseAgent):
             ({"space", "welcoming", "variety", "threshold", "entrance"},
              {"waiting", "room", "chairs", "chair", "color", "colour", "same",
               "different", "lobby", "doorway"}),
+            # rivalry fueled by care of shared greenery ↔ siblings fight over watering ficus
+            ({"rivalry", "fueled", "care", "shared", "greenery", "green"},
+             {"siblings", "fought", "fight", "water", "watering", "ficus", "plant",
+              "tree", "garden"}),
             # broken umbrella posted through every mailbox after storm
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
@@ -1490,6 +1535,10 @@ class CustomAgent(BaseAgent):
             "variety": {"color", "colour", "different", "chairs", "same"},
             "threshold": {"waiting", "room", "doorway", "lobby", "entrance"},
             "welcoming": {"waiting", "room", "lobby"},
+            "rivalry": {"siblings", "fought", "fight", "water"},
+            "greenery": {"ficus", "plant", "tree", "garden", "water", "watering"},
+            "shared": {"siblings", "ficus", "water"},
+            "care": {"water", "watering", "ficus", "plant"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []

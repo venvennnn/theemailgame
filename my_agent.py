@@ -45,7 +45,9 @@ RE_SIGN_LIST = re.compile(
 )
 
 FUZZY_MARK = "(from last round"
-RE_SIGNED_JSON = re.compile(r"SIGNED_MESSAGE_JSON:\s*(?P<j>\{.*)", re.DOTALL)
+RE_SIGNED_JSON = re.compile(
+    r"SIGNED_MESSAGE_JSON:\s*(?P<j>\{.*)", re.DOTALL | re.IGNORECASE
+)
 RE_PRIOR_MESSAGE_JSON = re.compile(
     r"PRIOR_MESSAGE_JSON:\s*(?P<j>\{.*?\})", re.DOTALL
 )
@@ -788,17 +790,20 @@ class CustomAgent(BaseAgent):
         else:
             self.alive_this_round.add(sender)
 
-        if "SIGNED_MESSAGE_JSON:" in body:
+        if re.search(r"SIGNED_MESSAGE_JSON\s*:", body, re.IGNORECASE):
             j = RE_SIGNED_JSON.search(body)
             if j:
                 self._ingest_signature(sender, j.group("j"))
+            else:
+                # Fallback: brace-scan for a signature object (adarsh-style prose wrap).
+                self._ingest_signature_fallback(sender, body)
 
         if (
             self.my_message
             and sender not in self.got_sig_from
             and sender not in self.refused_us
             and RE_OFFER_TO_SIGN.search(body)
-            and "SIGNED_MESSAGE_JSON:" not in body
+            and not re.search(r"SIGNED_MESSAGE_JSON\s*:", body, re.IGNORECASE)
         ):
             self._pending_short_asks.append(sender)
 
@@ -1306,6 +1311,29 @@ class CustomAgent(BaseAgent):
                 return cand
         return None
 
+    def _ingest_signature_fallback(self, sender: str, body: str) -> None:
+        """Find a signature JSON object even if the marker line is mangled."""
+        idx = body.find("{")
+        while idx != -1:
+            depth, end = 0, None
+            for i, ch in enumerate(body[idx:]):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx + i + 1
+                        break
+            if end is None:
+                return
+            chunk = body[idx:end]
+            if '"signature"' in chunk and (
+                '"original_message"' in chunk or '"signed_for"' in chunk
+            ):
+                self._ingest_signature(sender, chunk)
+                return
+            idx = body.find("{", end)
+
     def _ingest_signature(self, sender: str, raw_json: str) -> None:
         depth, end = 0, None
         for i, ch in enumerate(raw_json):
@@ -1327,21 +1355,28 @@ class CustomAgent(BaseAgent):
             return
 
         signer = str(sig.get("signer") or "").strip()
+        signed_for = str(sig.get("signed_for") or "").strip()
+        me = str(self.agent_id or "").strip()
         if not signer:
             self._log(f"ignoring signature with empty signer from {sender}")
             return
-        if signer == self.agent_id:
+        if signer.lower() == me.lower():
             self._log("ignoring self-signed payload")
             return
-        if signer != sender:
+        # Case-insensitive — peers/UI often differ on Venmani_A_D vs venmani_a_d.
+        if signer.lower() != sender.lower():
             self._log(
                 f"ignoring signature: signer={signer!r} != sender={sender!r}"
             )
             return
 
-        if sig.get("signed_for") != self.agent_id:
-            self._log(f"ignoring signature made out to {sig.get('signed_for')}")
+        if signed_for.lower() != me.lower():
+            self._log(f"ignoring signature made out to {signed_for!r}")
             return
+        # Normalize ids to our canonical agent_id for submission.
+        sig = dict(sig)
+        sig["signer"] = sender
+        sig["signed_for"] = me
 
         original = sig.get("original_message")
         if self.my_message and original != self.my_message:
@@ -1355,38 +1390,38 @@ class CustomAgent(BaseAgent):
             )
         # Quote-grabber junk (fed by old placeholder templates, etc.).
         if self._norm_msg(str(original or "")) in {
-            "<your message>", "your message", "agent", self.agent_id.lower()
+            "<your message>", "your message", "agent", me.lower()
         }:
             self._log(f"ignoring {sender} junk signature on {original!r}")
             return
 
         key = (
-            signer,
-            sig.get("signed_for"),
-            sig.get("original_message"),
+            sender.lower(),
+            me.lower(),
+            self._norm_msg(str(original or "")),
         )
         if key in self.submitted:
             return
         self.submitted.add(key)
-        self.got_sig_from.add(signer)
-        self.deadbeat_counts.pop(signer, None)
-        self.alive_this_round.add(signer)
+        self.got_sig_from.add(sender)
+        self.deadbeat_counts.pop(sender, None)
+        self.alive_this_round.add(sender)
         self.submit_signature(sig)
         self.msgs_this_game += 1
-        self._log(f"SUBMITTED signature from {signer}")
+        self._log(f"SUBMITTED signature from {sender}")
         # Release hostage provide once we have their signature this round.
-        held = (getattr(self, "_pending_hostage_sign", {}) or {}).pop(signer, None)
+        held = (getattr(self, "_pending_hostage_sign", {}) or {}).pop(sender, None)
         if (
             held
-            and ("sign", signer) not in self._sent_kinds
-            and self._may_sign_for(signer)
+            and ("sign", sender) not in self._sent_kinds
+            and self._may_sign_for(sender)
             and not _is_junk_ask(held)
             and not self._is_our_message_any_round(held)
         ):
-            self._sent_kinds.add(("sign", signer))
-            self.signed_this_round.add(signer)
-            self._log(f"HOSTAGE release — signing {signer}")
-            self._sign_with_submit_nudge(signer, held)
+            self._sent_kinds.add(("sign", sender))
+            self.signed_this_round.add(sender)
+            self._log(f"HOSTAGE release — signing {sender}")
+            self._sign_with_submit_nudge(sender, held)
 
     # ------------------------------------------------------------------
     # authorization — moderator list only; body claims never count
@@ -1668,6 +1703,12 @@ class CustomAgent(BaseAgent):
             # losing track of personal possessions under pressure ↔ auctioneer sold own watch
             ({"losing", "track", "personal", "possessions", "pressure", "belongings"},
              {"auctioneer", "sold", "watch", "sale", "accidentally", "own", "pocket"}),
+            # entries altered prior to official evaluation ↔ pie slice missing before judging
+            ({"entries", "altered", "prior", "official", "evaluation", "judging"},
+             {"pie", "pies", "slice", "missing", "contest", "judging", "before"}),
+            # tradition recognized by rare attire ↔ green tie on leap day only
+            ({"tradition", "recognized", "rare", "attire", "clothing"},
+             {"tie", "green", "leap", "day", "conductor", "wore", "bright", "only"}),
             # broken umbrella posted through every mailbox after storm
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",

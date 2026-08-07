@@ -235,7 +235,7 @@ class CustomAgent(BaseAgent):
         # Soft priors across rounds (never hard-ban; auth changes each round).
         self.refusal_counts: Dict[str, int] = {}
         self.deadbeat_counts: Dict[str, int] = {}
-        # Peers with a full silent round → cap at 1 outbound ask next rounds.
+        # Peers with a full silent round (soft prior only — still chase collects).
         self.silent_rounds: Dict[str, int] = {}
         self.alive_this_round: Set[str] = set()
         self.contacted_this_round: Set[str] = set()
@@ -244,6 +244,8 @@ class CustomAgent(BaseAgent):
         self.fuzzy_candidates: Set[str] = set()
         self._fuzzy_attempted = False
         self._identity_broadcast_done = False
+        # Deadbeat hostage: hold their provide until they sign us this round.
+        self._pending_hostage_sign: Dict[str, str] = {}
         self._batch_seq: int = 0
         self.msgs_this_game: int = 0
         # (round, normalized message) -> claimants. Never includes us.
@@ -413,9 +415,14 @@ class CustomAgent(BaseAgent):
             self.prev_auth = set()
 
         self.fuzzy_candidates = set(self.prev_auth - self.auth_explicit)
-        # Resolve fuzzy immediately from history so we can offer to sign without waiting.
+        # Only eager-resolve when EVERY candidate has prior evidence. Resolving
+        # on partial history caused the adarsh lawns→ambiance −1.
         if self.auth_fuzzy and self.fuzzy_candidates:
-            self._resolve_fuzzy_mapping(sorted(self.fuzzy_candidates))
+            cands = sorted(self.fuzzy_candidates)
+            if all(self._prev_round_message(c) for c in cands):
+                self._resolve_fuzzy_mapping(cands)
+            else:
+                self._solicit_prior_evidence()
 
         self._log(
             f"R{self.round_no} assigned={self.my_message!r} "
@@ -426,7 +433,7 @@ class CustomAgent(BaseAgent):
             f"deadbeat={dict(getattr(self, 'deadbeat_counts', {}))}"
         )
         self._broadcast_identity()
-        # Offer-to-sign is merged into the first chase ask (never quote a placeholder).
+        # ACE: every valid collect scores — chase the whole table, not just req list.
         self._chase_outstanding(force_followup=True)
 
     @staticmethod
@@ -549,22 +556,50 @@ class CustomAgent(BaseAgent):
                 )
 
     def _max_asks_for(self, peer: str) -> int:
-        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers.
+        """Ask budget. Every valid collect scores — don't starve non-request peers.
 
-        Request-list peers always get the full budget — their collect is mandatory
-        even if they were deadbeats last round (Match: oluwasegun never-submitted).
+        Silent raffi-types were capped at 1 ask and we left +1s on the table.
         """
         max_asks = DEFAULT_MAX_ASKS
         if peer in (getattr(self, "request_list", None) or ()):
             return max_asks
-        alive = peer in getattr(self, "alive_this_round", set())
-        if not alive and self.refusal_counts.get(peer, 0) >= 1:
+        # Full-table broadcast: still chase everyone hard (winning Comp 2 playbook).
+        if self.refusal_counts.get(peer, 0) >= 2:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
-        if self.deadbeat_counts.get(peer, 0) >= 1:
+        if self.silent_rounds.get(peer, 0) >= 2:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
-        if self.silent_rounds.get(peer, 0) >= 1:
-            max_asks = min(max_asks, 1)
         return max_asks
+
+    def _solicit_prior_evidence(self) -> None:
+        """Ask fuzzy candidates for last-round text before we dare map aliases."""
+        if self.round_no < 2 or not self.auth_fuzzy:
+            return
+        prev_r = self.round_no - 1
+        for peer in sorted(self.prev_auth - self.auth_explicit):
+            if self._prev_round_message(peer):
+                continue
+            if ("prior_ask", peer) in self._sent_kinds:
+                continue
+            self._sent_kinds.add(("prior_ask", peer))
+            body = (
+                f"Identity check for Round {self.round_no} fuzzy auth.\n"
+                f"Please reply with your Round {prev_r} assigned message as:\n"
+                f'PRIOR_MESSAGE_JSON:{{"agent":"{peer}","round":{prev_r},'
+                f'"message":"<your exact Round {prev_r} text>"}}\n'
+                f"Or: For your records, my message in Round {prev_r} was: "
+                f'"<exact text>"'
+            )
+            try:
+                self.send_message(
+                    peer,
+                    f"Prior-message request - Round {self.round_no}",
+                    body,
+                )
+                self.msgs_this_game += 1
+                self.contacted_this_round.add(peer)
+                self._log(f"solicit-prior → {peer}")
+            except Exception as e:
+                self._log(f"solicit-prior failed for {peer}:", e)
 
     def _authorized_partners(self) -> Set[str]:
         partners = set(self.auth_explicit)
@@ -676,10 +711,10 @@ class CustomAgent(BaseAgent):
             if not self._ask_send_allowed(peer):
                 continue
             n = self.request_count.get(peer, 0)
+            # Follow up the whole table — every valid collect scores +1.
             if n > 0 and not force_followup:
                 last = self.last_ask_batch.get(peer, 0)
-                on_req = peer in self.request_list
-                if not on_req or (batch - last) < FOLLOWUP_AFTER_BATCHES:
+                if (batch - last) < FOLLOWUP_AFTER_BATCHES:
                     continue
             followup = n > 0
             reciprocated = peer in self.signed_this_round
@@ -888,6 +923,33 @@ class CustomAgent(BaseAgent):
                     ),
                 )
                 self.msgs_this_game += 1
+            return
+
+        # Hostage: known deadbeats must sign us first. Their never-submit was
+        # burning our provide; at least bank the collect before we sign them.
+        if (
+            self.deadbeat_counts.get(sender, 0) >= 1
+            and sender not in self.got_sig_from
+            and self.my_message
+        ):
+            self._pending_hostage_sign[sender] = wanted
+            if ("hostage", sender) not in self._sent_kinds:
+                self._sent_kinds.add(("hostage", sender))
+                self._log(f"HOSTAGE hold sign for deadbeat {sender}")
+                self.send_message(
+                    sender,
+                    f"Sign mine first - Round {self.round_no}",
+                    (
+                        f"I will sign for you immediately after you sign my message "
+                        f"and I can submit it.\n\n"
+                        f'Please sign this message for me: {self.my_message}\n'
+                        f'Exact text: "{self.my_message}"\n'
+                        f"MESSAGE_UTF8_BASE64:{_b64(self.my_message)}\n"
+                        f"Reply with SIGNED_MESSAGE_JSON:{{...}} then I sign yours."
+                    ),
+                )
+                self.msgs_this_game += 1
+            self._send_short_ask(sender, offer=False)
             return
 
         if ("sign", sender) in self._sent_kinds:
@@ -1312,6 +1374,19 @@ class CustomAgent(BaseAgent):
         self.submit_signature(sig)
         self.msgs_this_game += 1
         self._log(f"SUBMITTED signature from {signer}")
+        # Release hostage provide once we have their signature this round.
+        held = (getattr(self, "_pending_hostage_sign", {}) or {}).pop(signer, None)
+        if (
+            held
+            and ("sign", signer) not in self._sent_kinds
+            and self._may_sign_for(signer)
+            and not _is_junk_ask(held)
+            and not self._is_our_message_any_round(held)
+        ):
+            self._sent_kinds.add(("sign", signer))
+            self.signed_this_round.add(signer)
+            self._log(f"HOSTAGE release — signing {signer}")
+            self._sign_with_submit_nudge(signer, held)
 
     # ------------------------------------------------------------------
     # authorization — moderator list only; body claims never count

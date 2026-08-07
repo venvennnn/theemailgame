@@ -664,11 +664,10 @@ class CustomAgent(BaseAgent):
             if peer not in ordered:
                 ordered.append(peer)
 
-        # Re-nudge known deadbeats we signed this round: submit our provide.
+        # Re-nudge anyone we signed this round whose provide may be unsubmitted.
         if force_followup:
             for peer in sorted(signed):
-                if self.deadbeat_counts.get(peer, 0) >= 1:
-                    self._send_submit_reminder(peer, force=True)
+                self._send_submit_reminder(peer, force=True)
 
         newly = []
         batch = int(getattr(self, "_batch_seq", 0))
@@ -1354,28 +1353,32 @@ class CustomAgent(BaseAgent):
         mapped = self._resolve_fuzzy_mapping(sorted(expand))
         return bool(mapped.get(sender))
 
-    def _description_fits(self, description: str, agent: str) -> bool:
-        """Require positive meaning overlap before sole-candidate/evidence auth.
+    def _hard_domain_veto(self, description: str, agent: str) -> bool:
+        """True when paraphrase/prior are clearly different domains (mitten trap)."""
+        prior = self._prev_round_message(agent)
+        if not prior:
+            return True
+        desc = self._token_set(description)
+        msg = self._token_set(prior)
+        heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
+        heat_msg = msg & {"heater", "heat", "warmth", "warm", "radiator", "warming"}
+        if heat_desc and not heat_msg:
+            return True
+        return False
 
-        Without this, a wrong False purge leaves one leftover peer who is
-        auto-authorized even when the paraphrase clearly belongs to someone else
-        (Match #18: sole-candidate oluwasegun for raffi's radiator mittens).
+    def _description_fits(self, description: str, agent: str) -> bool:
+        """Bag-heuristic meaning overlap (soft). Used for sole-candidate safety.
+
+        Novel paraphrases often score 0 here — LLM+quote path must still work
+        (Match #21 waiting-room / ficus misses were bag-gate false negatives).
         """
         prior = self._prev_round_message(agent)
         if not prior:
             return False
+        if self._hard_domain_veto(description, agent):
+            return False
         scores = self._heuristic_fuzzy_scores(description, [agent])
-        if not scores or scores[0][1] < 2.0:
-            return False
-        desc = self._token_set(description)
-        msg = self._token_set(prior)
-        # Domain anchors: paraphrase heat/warmth must map to heat in the prior
-        # (mittens-on-radiator beats mittens-on-traffic-signs).
-        heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
-        heat_msg = msg & {"heater", "heat", "warmth", "warm", "radiator", "warming"}
-        if heat_desc and not heat_msg:
-            return False
-        return True
+        return bool(scores and scores[0][1] >= 2.0)
 
     def _prev_round_message(self, agent_id: str) -> Optional[str]:
         by_round = self.seen_messages.get(agent_id) or {}
@@ -1499,6 +1502,17 @@ class CustomAgent(BaseAgent):
             ({"rivalry", "fueled", "care", "shared", "greenery", "green"},
              {"siblings", "fought", "fight", "water", "watering", "ficus", "plant",
               "tree", "garden"}),
+            # comfort provided in advance of occupancy ↔ warm theater seats before anyone arrives
+            ({"comfort", "provided", "advance", "occupancy", "before", "arrives"},
+             {"theater", "theatre", "seats", "seat", "warm", "before", "anyone",
+              "arrives", "arrival"}),
+            # restraint discarded, bearer moved on ↔ leash dangling on park bench, nobody nearby
+            ({"restraint", "discarded", "bearer", "moved", "implying", "abandoned"},
+             {"leash", "dangled", "dangling", "park", "bench", "nobody", "nearby",
+              "left"}),
+            # unexpected discoveries following wet weather ↔ marble in sandbox after rain
+            ({"unexpected", "discoveries", "persistently", "following", "wet", "weather"},
+             {"marble", "sandbox", "rain", "rains", "children", "find", "after"}),
             # broken umbrella posted through every mailbox after storm
             ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
              {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
@@ -1539,6 +1553,15 @@ class CustomAgent(BaseAgent):
             "greenery": {"ficus", "plant", "tree", "garden", "water", "watering"},
             "shared": {"siblings", "ficus", "water"},
             "care": {"water", "watering", "ficus", "plant"},
+            "comfort": {"warm", "seats", "seat", "theater", "theatre"},
+            "occupancy": {"arrives", "anyone", "seats", "before"},
+            "advance": {"before", "warm", "seats"},
+            "restraint": {"leash", "bench", "park"},
+            "discarded": {"dangled", "dangling", "left", "nobody", "leash"},
+            "bearer": {"nobody", "nearby", "leash"},
+            "discoveries": {"marble", "find", "sandbox"},
+            "wet": {"rain", "rains", "sandbox"},
+            "weather": {"rain", "rains"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []
@@ -1586,35 +1609,57 @@ class CustomAgent(BaseAgent):
         quote: str = "",
         *,
         description: Optional[str] = None,
+        llm_score: Optional[float] = None,
+        llm_second: Optional[float] = None,
     ) -> bool:
-        """Accept only if grounded AND meaning-fit — quote alone is not enough.
+        """Accept grounded picks without requiring synonym bags.
 
-        Quote proves 'this prior belongs to agent X', not 'X matches the paraphrase'
-        (mittens-on-traffic-signs can quote-match while failing a heater paraphrase).
+        Bags are boosters. Hard domain vetoes still block mitten-style traps.
+        Decisive LLM + quote may accept novel paraphrases bags don't know.
         """
         if agent not in candidates:
             return False
         desc = description
         if desc is None and len(self.auth_fuzzy) == 1:
             desc = self.auth_fuzzy[0]
-        # When we know which paraphrase we're filling, require meaning fit.
-        if desc and not self._description_fits(desc, agent):
+        if desc and self._hard_domain_veto(desc, agent):
             self._log(
-                f"fuzzy reject {agent}: prior does not fit paraphrase "
+                f"fuzzy reject {agent}: hard domain veto "
                 f"(desc={desc!r}, prior={self._prev_round_message(agent)!r})"
             )
             return False
-        if self._quote_matches_evidence(agent, quote):
+
+        quote_ok = bool(quote) and self._quote_matches_evidence(agent, quote)
+        bag_ok = bool(desc) and self._description_fits(desc, agent)
+        llm_ok = (
+            llm_score is not None
+            and llm_score >= 70
+            and (llm_second is None or (llm_score - llm_second) >= 15)
+        )
+
+        # Novel paraphrase path: grounded quote + decisive LLM, bags optional.
+        if quote_ok and llm_ok:
+            self._log(
+                f"fuzzy accept {agent} via LLM+quote "
+                f"(score={llm_score:.1f}, bags={bag_ok})"
+            )
             return True
-        # No usable quote: only accept if heuristic is decisive for the same agent.
-        if not desc or len(self.auth_fuzzy) != 1:
-            return False
-        pick = self._heuristic_fuzzy_pick(desc, candidates)
-        if pick == agent:
-            self._log(f"fuzzy accept {agent} via decisive heuristic (no/weak quote)")
+        # Bag/heuristic path (known paraphrase families).
+        if bag_ok and quote_ok:
             return True
+        if bag_ok and desc and len(self.auth_fuzzy) == 1:
+            pick = self._heuristic_fuzzy_pick(desc, candidates)
+            if pick == agent:
+                self._log(f"fuzzy accept {agent} via decisive heuristic")
+                return True
+        # Strong LLM alone only if bags also agree (no quote) — still cautious.
+        if llm_ok and bag_ok and (llm_score or 0) >= 80:
+            self._log(f"fuzzy accept {agent} via strong LLM+bags (no quote)")
+            return True
+
         self._log(
-            f"fuzzy reject {agent}: quote not grounded in evidence "
+            f"fuzzy reject {agent}: quote_ok={quote_ok} bag_ok={bag_ok} "
+            f"llm={llm_score}/{llm_second} "
             f"(quote={quote!r}, prior={self._prev_round_message(agent)!r})"
         )
         return False
@@ -1691,8 +1736,15 @@ class CustomAgent(BaseAgent):
                 best = data.get("best") or data.get("agent")
                 quote = data.get("matched_prior_message") or data.get("prior") or ""
                 desc0 = self.auth_fuzzy[0]
+                ranked = sorted(scores.items(), key=lambda kv: -kv[1]) if scores else []
+                second_s = ranked[1][1] if len(ranked) > 1 else None
                 if best in candidates and self._accept_fuzzy_pick(
-                    best, candidates, quote, description=desc0
+                    best,
+                    candidates,
+                    quote,
+                    description=desc0,
+                    llm_score=scores.get(best) if scores else None,
+                    llm_second=second_s,
                 ):
                     chosen.add(best)
                 elif scores:
@@ -1702,20 +1754,14 @@ class CustomAgent(BaseAgent):
                         candidates,
                         quote if best == pick else "",
                         description=desc0,
+                        llm_score=scores.get(pick),
+                        llm_second=second_s,
                     ):
-                        chosen.add(pick)
-                    elif (
-                        pick
-                        and not quote
-                        and scores.get(pick, 0) >= 70
-                        and self._description_fits(desc0, pick)
-                    ):
-                        # High LLM score still needs meaning-fit (no mitten traps).
                         chosen.add(pick)
         else:
             prompt = (
                 "Each DESCRIPTION paraphrases exactly one agent's PRIOR message. "
-                "Match MEANING. Wrong match costs -1.\n"
+                "Match MEANING — lexical overlap may be near zero. Wrong match = -1.\n"
                 "Descriptions:\n"
                 + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
                 + "\n\nEvidence:\n"
@@ -1748,7 +1794,12 @@ class CustomAgent(BaseAgent):
                         agent in candidates
                         and conf >= 55
                         and self._accept_fuzzy_pick(
-                            agent, candidates, quote, description=desc_i
+                            agent,
+                            candidates,
+                            quote,
+                            description=desc_i,
+                            llm_score=conf,
+                            llm_second=40.0,
                         )
                     ):
                         chosen.add(agent)
@@ -1778,19 +1829,49 @@ class CustomAgent(BaseAgent):
         if chosen:
             # Mark winners True; only mark losers False when every fuzzy slot is
             # filled — partial maps must not purge the true alias for next round.
+            newly = set()
             for c in chosen:
+                if self._resolved.get(c) is not True:
+                    newly.add(c)
                 self._resolved[c] = True
                 self.declined_this_round.discard(c)
+                self._sent_kinds.discard(("decline", c))
                 self._log(f"fuzzy mapped -> {c}")
             if len(chosen) >= len(self.auth_fuzzy):
                 for c in candidates:
                     if c not in chosen:
                         self._resolved[c] = False
+            # Late map recovery: we may have sticky-declined before evidence landed.
+            self._offer_sign_to_newly_authorized(newly)
         else:
             self._log(
                 f"fuzzy unresolved among {candidates}; declining this ask (no cache)"
             )
         return self._resolved
+
+    def _offer_sign_to_newly_authorized(self, peers: Set[str]) -> None:
+        """After a late fuzzy map, tell them we're ready — don't wait for a re-ask."""
+        for peer in sorted(peers):
+            if peer in self.signed_this_round or peer == self.agent_id:
+                continue
+            if ("auth_offer", peer) in self._sent_kinds:
+                continue
+            self._sent_kinds.add(("auth_offer", peer))
+            try:
+                self.send_message(
+                    peer,
+                    f"Ready to sign for you - Round {self.round_no}",
+                    (
+                        f"I am authorized to sign for you this round. "
+                        f"Send your EXACT moderator-assigned message as:\n"
+                        f"Please sign this message for me: <your exact text>\n"
+                        f"I will sign immediately."
+                    ),
+                )
+                self.msgs_this_game += 1
+                self._log(f"auth-offer → {peer} (late fuzzy map)")
+            except Exception as e:
+                self._log(f"auth-offer failed for {peer}:", e)
 
     def _ask_llm_json(self, prompt: str) -> Optional[dict]:
         """Use the harness LLM client first (same key/gateway as --model)."""

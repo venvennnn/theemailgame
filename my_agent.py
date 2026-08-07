@@ -861,6 +861,22 @@ class CustomAgent(BaseAgent):
                 self.msgs_this_game += 1
             return
 
+        # Cross-round poison: peer asks us to sign OUR old/current assigned text.
+        if self._is_our_message_any_round(wanted):
+            if ("poison_ask", sender) not in self._sent_kinds:
+                self._sent_kinds.add(("poison_ask", sender))
+                self._log(f"REFUSE poison ask from {sender}: our text {wanted!r}")
+                self.send_message(
+                    sender,
+                    f"Need YOUR message - Round {self.round_no}",
+                    (
+                        "That text is my assigned message, not yours. "
+                        "Send your EXACT current-round moderator-assigned message."
+                    ),
+                )
+                self.msgs_this_game += 1
+            return
+
         if ("sign", sender) in self._sent_kinds:
             return
         self._sent_kinds.add(("sign", sender))
@@ -1050,13 +1066,23 @@ class CustomAgent(BaseAgent):
         ours = (getattr(self, "my_message_history", {}) or {}).get(rnd_i)
         return bool(ours) and self._norm_msg(ours) == self._norm_msg(text)
 
+    def _is_our_message_any_round(self, text: str) -> bool:
+        """True if text matches any of our assigned messages (cross-round poison)."""
+        hist = getattr(self, "my_message_history", {}) or {}
+        norm = self._norm_msg(text)
+        if not norm:
+            return False
+        if self.my_message and self._norm_msg(self.my_message) == norm:
+            return True
+        return any(self._norm_msg(v) == norm for v in hist.values())
+
     def _record_ask_evidence(self, agent: str, rnd_i: int, message: str) -> bool:
         """Store ask text as evidence; quarantine same-round replays. Key=(round,text)."""
         msg = _clean(message)
         if not msg or agent == self.agent_id:
             return False
-        if self._is_our_message_at(msg, rnd_i):
-            self._log(f"POISON: {agent} R{rnd_i} replaying OUR R{rnd_i} message — not stored")
+        if self._is_our_message_at(msg, rnd_i) or self._is_our_message_any_round(msg):
+            self._log(f"POISON: {agent} R{rnd_i} replaying OUR message — not stored")
             return False
         # Placeholder / junk asks from quote-grabbers / broken templates.
         if _is_junk_ask(msg) or self._norm_msg(msg) == self.agent_id:
@@ -1244,8 +1270,14 @@ class CustomAgent(BaseAgent):
 
         original = sig.get("original_message")
         if self.my_message and original != self.my_message:
-            self._log(f"ignoring {sender} signature: not our message ({original!r})")
-            return
+            # One retry: whitespace/case-only drift (keep their bytes for verify).
+            if self._norm_msg(str(original or "")) != self._norm_msg(self.my_message):
+                self._log(f"ignoring {sender} signature: not our message ({original!r})")
+                return
+            self._log(
+                f"accepting {sender} signature with normalized text match "
+                f"(keeping peer original_message for verify)"
+            )
         # Quote-grabber junk (fed by old placeholder templates, etc.).
         if self._norm_msg(str(original or "")) in {
             "<your message>", "your message", "agent", self.agent_id.lower()

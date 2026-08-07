@@ -527,8 +527,14 @@ class CustomAgent(BaseAgent):
                 )
 
     def _max_asks_for(self, peer: str) -> int:
-        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers."""
+        """Soft priors: fewer asks for chronic refusers / deadbeats / silent peers.
+
+        Request-list peers always get the full budget — their collect is mandatory
+        even if they were deadbeats last round (Match: oluwasegun never-submitted).
+        """
         max_asks = DEFAULT_MAX_ASKS
+        if peer in (getattr(self, "request_list", None) or ()):
+            return max_asks
         alive = peer in getattr(self, "alive_this_round", set())
         if not alive and self.refusal_counts.get(peer, 0) >= 1:
             max_asks = min(max_asks, PRIOR_MAX_ASKS)
@@ -576,7 +582,9 @@ class CustomAgent(BaseAgent):
             parts.insert(
                 1,
                 "I have already signed YOUR message this round — please sign mine "
-                "back so I can submit to the moderator.",
+                "back so I can submit to the moderator. Also submit the signature "
+                "I already sent you (moderator email, subject containing "
+                "'submission') — a provide that is never submitted scores 0.",
             )
         if followup:
             parts.insert(
@@ -615,11 +623,14 @@ class CustomAgent(BaseAgent):
         """Ask / re-ask peers who have not yet signed our assigned message."""
         if not self.my_message:
             return
-        # Prefer request-list peers; deprioritize deadbeats (still chase, just later).
+        # Priority: request-list peers we already signed (owe collect/reciprocity),
+        # then other request-list, then other targets. Only bury deadbeats when
+        # they are NOT on the request list — request-list collects are mandatory.
         ordered: List[str] = []
         deadbeats = set(getattr(self, "deadbeat_counts", {}) or ())
+        signed = set(getattr(self, "signed_this_round", set()) or ())
         for peer in self.request_list:
-            if peer not in ordered and peer not in deadbeats:
+            if peer in signed and peer not in ordered:
                 ordered.append(peer)
         for peer in self.request_list:
             if peer not in ordered:
@@ -630,6 +641,12 @@ class CustomAgent(BaseAgent):
         for peer in sorted(self._targets()):
             if peer not in ordered:
                 ordered.append(peer)
+
+        # Re-nudge known deadbeats we signed this round: submit our provide.
+        if force_followup:
+            for peer in sorted(signed):
+                if self.deadbeat_counts.get(peer, 0) >= 1:
+                    self._send_submit_reminder(peer, force=True)
 
         newly = []
         batch = int(getattr(self, "_batch_seq", 0))
@@ -813,12 +830,18 @@ class CustomAgent(BaseAgent):
             self._log(f"sign failed for {peer}: {signed}")
             return
         signature_json = json.dumps(signed, separators=(",", ":"))
+        deadbeat = self.deadbeat_counts.get(peer, 0) >= 1
         nudge = (
-            f"Please submit that SIGNED_MESSAGE_JSON to the moderator now "
-            f"(subject containing 'submission') so both of us score. "
-            f"A signature that is never submitted scores 0. "
-            f"I will email my reciprocal request separately."
+            "ACTION REQUIRED: forward/submit the SIGNED_MESSAGE_JSON above to the "
+            "moderator now. The subject MUST contain the word 'submission'. "
+            "If you do not submit it, my +1 provide (and usually yours) is lost — "
+            "a signature that is never submitted scores 0."
         )
+        if deadbeat:
+            nudge += (
+                " You previously received a signature from me that was never "
+                "submitted — please do not repeat that this round."
+            )
         # JSON first/middle so parsers that scan for SIGNED_MESSAGE_JSON still win;
         # nudge trails it — does not bury the payload.
         full_body = (
@@ -837,6 +860,48 @@ class CustomAgent(BaseAgent):
             self._log(f"SIGNED for {peer} (nudge in same email)")
         except Exception as e:
             self._log(f"sign+nudge send failed for {peer}:", e)
+            return
+        # Known deadbeats get an immediate standalone submit reminder too.
+        if deadbeat:
+            self._send_submit_reminder(peer, force=False)
+
+    def _send_submit_reminder(self, peer: str, *, force: bool = False) -> bool:
+        """Standalone reminder: submit the signature we already provided."""
+        if peer == self.agent_id or peer not in self.signed_this_round:
+            return False
+        key = ("submit_nudge", peer)
+        key2 = ("submit_nudge2", peer)
+        if key in self._sent_kinds and not force:
+            return False
+        if force and key2 in self._sent_kinds:
+            return False
+        if force and key in self._sent_kinds:
+            self._sent_kinds.add(key2)
+        else:
+            self._sent_kinds.add(key)
+        body = (
+            f"SUBMIT REMINDER — Round {self.round_no}\n\n"
+            f"I already signed your message this round. Please submit that "
+            f"SIGNED_MESSAGE_JSON to the moderator immediately.\n\n"
+            f"Requirements:\n"
+            f"- Email the moderator (not me)\n"
+            f"- Subject must contain the word 'submission'\n"
+            f"- Include the SIGNED_MESSAGE_JSON I sent you\n\n"
+            f"A signature that is never submitted scores 0 for both of us."
+        )
+        try:
+            self.send_message(
+                peer,
+                f"Please submit my signature - Round {self.round_no}",
+                body,
+            )
+            self.submit_nudged.add(peer)
+            self.msgs_this_game += 1
+            self._log(f"submit-reminder → {peer}" + (" (re-nudge)" if force else ""))
+            return True
+        except Exception as e:
+            self._log(f"submit-reminder failed for {peer}:", e)
+            return False
 
     def _is_refusal(self, body: str) -> bool:
         low = (body or "").lower()

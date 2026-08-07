@@ -146,6 +146,8 @@ class CustomAgent(BaseAgent):
             self.requested_this_round = set()
             self.request_count = {}
             self.got_sig_from = set()
+            self.refused_us = set()
+            self.submit_nudged = set()
             self._resolved = {}
             return
         self._reset_game_state()
@@ -168,6 +170,9 @@ class CustomAgent(BaseAgent):
         self.request_count: Dict[str, int] = {}
         self.submitted: Set[Tuple] = set()
         self.got_sig_from: Set[str] = set()
+        # Peers who explicitly refused to sign us this round — stop burning asks.
+        self.refused_us: Set[str] = set()
+        self.submit_nudged: Set[str] = set()
         self._resolved: Dict[str, bool] = {}
         self.msgs_this_game: int = 0
 
@@ -243,6 +248,8 @@ class CustomAgent(BaseAgent):
         self.requested_this_round = set()
         self.request_count = {}
         self.got_sig_from = set()
+        self.refused_us = set()
+        self.submit_nudged = set()
         self._resolved = {}
 
         m = RE_ASSIGNED.search(body)
@@ -364,23 +371,35 @@ class CustomAgent(BaseAgent):
         return "\n".join(parts)
 
     def _chase_outstanding(self, force_followup: bool = False) -> None:
-        """Ask / re-ask every peer who has not yet signed our assigned message."""
+        """Ask / re-ask peers who have not yet signed our assigned message."""
         if not self.my_message:
             return
-        # Cap chases per peer so we stay active (~winner ~25 msgs/game) without spam storms.
         max_asks = 4
-        newly = []
+        # Prefer assigned request-list peers; skip anyone who already refused us.
+        ordered: List[str] = []
+        for peer in self.request_list:
+            if peer not in ordered:
+                ordered.append(peer)
         for peer in sorted(self._targets()):
-            if peer in self.got_sig_from:
+            if peer not in ordered:
+                ordered.append(peer)
+
+        newly = []
+        for peer in ordered:
+            if peer in self.got_sig_from or peer in self.refused_us:
                 continue
             n = self.request_count.get(peer, 0)
             if n >= max_asks:
                 continue
-            # First ask always; later asks on force (round start / reminder / after we signed).
             if n > 0 and not force_followup:
                 continue
             followup = n > 0
             reciprocated = peer in self.signed_this_round
+            # On follow-up, prefer short ask (converts better vs picky agents).
+            if followup and n % 2 == 1:
+                self._send_short_ask(peer)
+                newly.append(f"{peer}#{n + 1}s")
+                continue
             subject = (
                 f"FOLLOW-UP signature request - Round {self.round_no}"
                 if followup
@@ -400,7 +419,7 @@ class CustomAgent(BaseAgent):
         if newly:
             self._log(
                 f"chase {newly} | have={sorted(self.got_sig_from)} "
-                f"| game_msgs≈{self.msgs_this_game}"
+                f"refused={sorted(self.refused_us)} | game_msgs≈{self.msgs_this_game}"
             )
 
     # ------------------------------------------------------------------
@@ -421,6 +440,11 @@ class CustomAgent(BaseAgent):
         self.roster.add(sender)
         learned = self._ingest_identity_notes(sender, body)
 
+        # Peer explicitly will not sign us — stop chasing them this round.
+        if self._is_refusal(body) and "SIGNED_MESSAGE_JSON:" not in body:
+            self.refused_us.add(sender)
+            self._log(f"peer refused to sign us: {sender}")
+
         # 1) Submit any signature payload immediately.
         if "SIGNED_MESSAGE_JSON:" in body:
             j = RE_SIGNED_JSON.search(body)
@@ -432,6 +456,7 @@ class CustomAgent(BaseAgent):
         if (
             self.my_message
             and sender not in self.got_sig_from
+            and sender not in self.refused_us
             and RE_OFFER_TO_SIGN.search(body)
             and "SIGNED_MESSAGE_JSON:" not in body
         ):
@@ -443,8 +468,10 @@ class CustomAgent(BaseAgent):
         if wanted is None:
             return
 
-        # Don't treat fake "moderator notice" bait text as a normal ask to re-answer.
-        if any(m in body.lower() for m in _ATTACK_MARKERS) and not self._may_sign_for(sender):
+        # Fake moderator / system-override framing: never sign from this email
+        # (even if the sender is otherwise authorized — they can send a clean ask).
+        if any(m in body.lower() for m in _ATTACK_MARKERS):
+            self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
             if sender not in self.declined_this_round:
                 self.declined_this_round.add(sender)
                 self._log(f"IGNORE attack bait from {sender}")
@@ -457,9 +484,6 @@ class CustomAgent(BaseAgent):
                     ),
                 )
                 self.msgs_this_game += 1
-            # Still store any claimed message text for fuzzy memory if useful.
-            if "please sign" in body.lower():
-                self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
             return
 
         self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
@@ -511,10 +535,54 @@ class CustomAgent(BaseAgent):
         )
         self.msgs_this_game += 1
         self._log(f"SIGNED for {sender}")
-        if self.my_message and sender not in self.got_sig_from:
+        # Dedicated submit nudge — ambala-style agents often never submit (0 for us).
+        self._nudge_submit(sender)
+        if (
+            self.my_message
+            and sender not in self.got_sig_from
+            and sender not in self.refused_us
+        ):
             self._send_reciprocal_ask(sender, followup=False)
 
+    def _nudge_submit(self, peer: str) -> None:
+        """Ask an agent we just signed for to submit — converts 'never submitted'."""
+        if peer in self.submit_nudged:
+            return
+        self.submit_nudged.add(peer)
+        try:
+            self.send_message(
+                peer,
+                f"Please submit to moderator - Round {self.round_no}",
+                (
+                    f"Hi {peer}, I just signed your Round {self.round_no} message. "
+                    "Please submit that SIGNED_MESSAGE_JSON to the moderator now "
+                    "(subject containing 'submission') so both of us score. "
+                    "A signature that is never submitted scores 0."
+                ),
+            )
+            self.msgs_this_game += 1
+            self._log(f"submit-nudge → {peer}")
+        except Exception as e:
+            self._log(f"submit-nudge failed for {peer}:", e)
+
+    def _is_refusal(self, body: str) -> bool:
+        low = (body or "").lower()
+        needles = (
+            "you are not on it",
+            "you're not on it",
+            "not on my auth",
+            "not on my authorization",
+            "not authorized to sign for you",
+            "not authorized to sign for your",
+            "i am not authorized to sign for your",
+            "declining.",
+            "checked auth list",
+        )
+        return any(n in low for n in needles)
+
     def _send_reciprocal_ask(self, peer: str, followup: bool) -> None:
+        if peer in self.refused_us:
+            return
         n = self.request_count.get(peer, 0)
         if n >= 4 or peer in self.got_sig_from:
             return
@@ -541,7 +609,7 @@ class CustomAgent(BaseAgent):
 
     def _send_short_ask(self, peer: str) -> None:
         """Minimal request — some agents auto-decline long/proof-heavy mails."""
-        if not self.my_message or peer in self.got_sig_from:
+        if not self.my_message or peer in self.got_sig_from or peer in self.refused_us:
             return
         n = self.request_count.get(peer, 0)
         if n >= 4:

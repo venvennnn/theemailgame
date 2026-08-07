@@ -815,8 +815,32 @@ class CustomAgent(BaseAgent):
         except Exception as e:
             self._log(f"short-ask failed for {peer}:", e)
 
+    def _record_identity_claim(
+        self, agent: str, rnd_i: int, msg: str, *, source: str
+    ) -> bool:
+        """Fill gaps only — never overwrite ask evidence or an earlier claim."""
+        bucket = self.seen_messages.setdefault(agent, {})
+        existing = bucket.get(rnd_i)
+        if existing is None:
+            bucket[rnd_i] = msg
+            self._log(f"{source} {agent} R{rnd_i}: {msg!r}")
+            return True
+        if existing != msg:
+            self._log(
+                f"{source} ignored (kept evidence) {agent} R{rnd_i}: "
+                f"claimed {msg!r} vs have {existing!r}"
+            )
+        return False
+
     def _ingest_identity_notes(self, sender: str, body: str) -> bool:
+        """Ingest peer-claimed prior texts. Never overwrite ask-derived evidence.
+
+        Peers lie (this match: raffi claimed michael's pharmacist line as his own).
+        Actual 'please sign this message for me' asks are ground truth and win.
+        """
         learned = False
+        explicit: List[Tuple[int, str]] = []
+        implicit: List[Tuple[int, str]] = []
         for pat in RE_IDENTITY_NOTES:
             for m in pat.finditer(body):
                 groups = m.groupdict()
@@ -824,13 +848,14 @@ class CustomAgent(BaseAgent):
                 msg = _clean(m.group("m"))
                 if not msg or "SIGNED_MESSAGE_JSON" in msg:
                     continue
-                # "last round" → previous round number when explicit round missing.
                 rnd_i = int(rnd) if rnd else max(1, self.round_no - 1)
-                bucket = self.seen_messages.setdefault(sender, {})
-                if bucket.get(rnd_i) != msg:
-                    bucket[rnd_i] = msg
-                    learned = True
-                    self._log(f"identity note {sender} R{rnd_i}: {msg!r}")
+                (explicit if rnd else implicit).append((rnd_i, msg))
+        # Prefer explicit "in Round N" claims over ambiguous "last round" fillers.
+        for rnd_i, msg in explicit + implicit:
+            if self._record_identity_claim(
+                sender, rnd_i, msg, source="identity note"
+            ):
+                learned = True
 
         # Peer tips: 'the agent who said "..." is riyan_sarkar'
         for m in re.finditer(
@@ -843,14 +868,12 @@ class CustomAgent(BaseAgent):
             snippet = m.group("snippet").strip()
             if who == self.agent_id or not snippet:
                 continue
-            # Store as weak prior-round evidence if we lack any for that agent.
             rnd_i = max(1, self.round_no - 1)
-            bucket = self.seen_messages.setdefault(who, {})
-            if rnd_i not in bucket:
-                bucket[rnd_i] = snippet
+            if self._record_identity_claim(
+                who, rnd_i, snippet, source=f"peer tip from {sender}"
+            ):
                 learned = True
                 self.roster.add(who)
-                self._log(f"peer tip: {who} ↔ {snippet!r} (from {sender})")
         return learned
 
     def _extract_ask(self, body: str) -> Optional[str]:
@@ -1038,6 +1061,13 @@ class CustomAgent(BaseAgent):
             ({"civic", "order", "mischief", "tinged", "briefly", "rule", "prank"},
              {"cat", "bookstore", "poetry", "skips", "lobby", "button", "presses",
               "mischief", "prank", "statue", "fountain", "library", "park"}),
+            # anticipation dimmed at the last moment ↔ candle out before midnight / near-miss
+            ({"anticipation", "dimmed", "last", "moment", "brink", "almost", "expect"},
+             {"candle", "midnight", "minutes", "before", "went", "out", "alarm",
+              "early", "almost", "nearly", "last", "moment"}),
+            # creativity halted by a difficult hue ↔ refuse to rehearse if orange
+            ({"creativity", "halted", "difficult", "hue", "color", "presence"},
+             {"singer", "rehearse", "orange", "refuses", "wears", "colour", "color"}),
         ]
         scores: List[Tuple[str, float]] = []
         for c in candidates:

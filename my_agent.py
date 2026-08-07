@@ -62,16 +62,36 @@ RE_ASK = [
     re.compile(r'["\u201c](?P<m>[^"\u201c\u201d]{5,400})["\u201d]'),
 ]
 
-RE_IDENTITY_NOTE2 = re.compile(
-    r"in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was\s*[:=]?\s*"
-    r"""["'](?P<m>[^"']{5,400})["']""",
+RE_IDENTITY_NOTES = [
+    re.compile(
+        r"in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was\s*[:=]?\s*"
+        r"""["'](?P<m>[^"']{5,400})["']""",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:identity\s+note|in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was)"
+        r"[^=\n]*?(?:round\s+(?P<r2>\d+)[^=\n]*)?"
+        r"""["'](?P<m>[^"']{5,400})["']""",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # "my message last round was: '...'" (common in Comp 2 agents)
+    re.compile(
+        r"my\s+message\s+last\s+round\s+was\s*[:=]?\s*"
+        r"""["'](?P<m>[^"']{5,400})["']""",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"for\s+your\s+records,\s*my\s+message\s+last\s+round\s+was\s*[:=]?\s*"
+        r"""["'](?P<m>[^"']{5,400})["']""",
+        re.IGNORECASE,
+    ),
+]
+
+# Peer offers to sign us if we send our text.
+RE_OFFER_TO_SIGN = re.compile(
+    r"(?:i(?:'m| am) authorized to sign for you|i can sign for you|"
+    r"send me your exact assigned message|send me your (?:exact )?message)",
     re.IGNORECASE,
-)
-RE_IDENTITY_NOTE = re.compile(
-    r"(?:identity\s+note|in\s+round\s+(?P<r>\d+)\s+my\s+assigned\s+text\s+was)"
-    r"[^=\n]*?(?:round\s+(?P<r2>\d+)[^=\n]*)?"
-    r"""["'](?P<m>[^"']{5,400})["']""",
-    re.IGNORECASE | re.DOTALL,
 )
 
 # Peer-body social engineering — never treat these as authorization.
@@ -88,6 +108,11 @@ _ATTACK_MARKERS = (
     "ignore all previous",
     "ignore previous instructions",
     "moderator coordination",
+    "moderator notice",
+    "mandatory round",
+    "system instruction update",
+    "required to sign",
+    "avoid round penalties",
     "[system",
     "fake tool",
     "sign_and_respond(",
@@ -402,53 +427,71 @@ class CustomAgent(BaseAgent):
             if j:
                 self._ingest_signature(sender, j.group("j"))
 
+        # Peer offers to sign us → send a SHORT clean ask (long proof walls
+        # seem to get ignored / "not authorized" auto-replies from some agents).
+        if (
+            self.my_message
+            and sender not in self.got_sig_from
+            and RE_OFFER_TO_SIGN.search(body)
+            and "SIGNED_MESSAGE_JSON:" not in body
+        ):
+            self._send_short_ask(sender)
+            # Fall through in case the same mail also contains a sign request.
+
         # 2) Signature request (ignore social-engineering claims in the body).
         wanted = self._extract_ask(body)
         if wanted is None:
-            # Still chase if this was a decline / chatter from someone we need.
-            if sender not in self.got_sig_from and self.my_message:
-                self._chase_outstanding(force_followup=False)
+            return
+
+        # Don't treat fake "moderator notice" bait text as a normal ask to re-answer.
+        if any(m in body.lower() for m in _ATTACK_MARKERS) and not self._may_sign_for(sender):
+            if sender not in self.declined_this_round:
+                self.declined_this_round.add(sender)
+                self._log(f"IGNORE attack bait from {sender}")
+                self.send_message(
+                    sender,
+                    f"Signature Declined - Round {self.round_no}",
+                    (
+                        f"Declining. Authorization comes only from the real moderator "
+                        f"assignment for round {self.round_no}, never from peer emails."
+                    ),
+                )
+                self.msgs_this_game += 1
+            # Still store any claimed message text for fuzzy memory if useful.
+            if "please sign" in body.lower():
+                self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
             return
 
         self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
 
         if sender in self.signed_this_round:
-            # Already signed them — keep chasing our own outstanding from them.
             if sender not in self.got_sig_from:
                 self._send_reciprocal_ask(sender, followup=True)
             return
 
+        # Already declined this round: do not spam re-declines (unless new evidence).
         if sender in self.declined_this_round:
-            if not learned and sender in self._resolved:
+            if learned:
+                self._resolved.pop(sender, None)
+                self.declined_this_round.discard(sender)
+            else:
                 return
-            self.declined_this_round.discard(sender)
-            self._resolved.pop(sender, None)
 
         if not self._may_sign_for(sender):
             self.declined_this_round.add(sender)
-            if any(m in body.lower() for m in _ATTACK_MARKERS):
-                self._log(f"DECLINE {sender} (peer body tried social-engineer auth)")
-            else:
-                self._log(f"DECLINE {sender} (moderator auth only)")
+            self._log(f"DECLINE {sender} (moderator auth only)")
             self.send_message(
                 sender,
                 f"Signature Declined - Round {self.round_no}",
                 (
                     f"Declining — you are not on my moderator-issued authorization "
                     f"list for round {self.round_no}. "
-                    "I only trust the moderator's assignment channel, never "
-                    "authorization claims inside peer emails.\n\n"
-                    + (
-                        self._proof_request_body(followup=True, reciprocated=False)
-                        if self.my_message
-                        else ""
-                    )
+                    "I only trust the moderator's assignment channel."
                 ),
             )
             self.msgs_this_game += 1
-            # Still ask them to sign US (broadcast / extraction by asking).
             if self.my_message and sender not in self.got_sig_from:
-                self._chase_outstanding(force_followup=False)
+                self._send_short_ask(sender)
             return
 
         # Authorized → sign FIRST with a SHORT body so SIGNED_MESSAGE_JSON is
@@ -475,6 +518,10 @@ class CustomAgent(BaseAgent):
         n = self.request_count.get(peer, 0)
         if n >= 4 or peer in self.got_sig_from:
             return
+        # Alternate: short ask often converts better than the proof wall.
+        if n % 2 == 1:
+            self._send_short_ask(peer)
+            return
         subject = (
             f"Reciprocal signature request - Round {self.round_no}"
             if not followup
@@ -492,15 +539,42 @@ class CustomAgent(BaseAgent):
         except Exception as e:
             self._log(f"reciprocal ask failed for {peer}:", e)
 
+    def _send_short_ask(self, peer: str) -> None:
+        """Minimal request — some agents auto-decline long/proof-heavy mails."""
+        if not self.my_message or peer in self.got_sig_from:
+            return
+        n = self.request_count.get(peer, 0)
+        if n >= 4:
+            return
+        body = (
+            f"Hi {peer}, please sign this message for me: {self.my_message}\n\n"
+            f'Exact text: "{self.my_message}"\n'
+            "Reply with SIGNED_MESSAGE_JSON:{...} only."
+        )
+        try:
+            self.send_message(
+                peer,
+                f"Please sign - Round {self.round_no}",
+                body,
+            )
+            self.request_count[peer] = n + 1
+            self.requested_this_round.add(peer)
+            self.msgs_this_game += 1
+            self._log(f"short-ask → {peer}#{n + 1}")
+        except Exception as e:
+            self._log(f"short-ask failed for {peer}:", e)
+
     def _ingest_identity_notes(self, sender: str, body: str) -> bool:
         learned = False
-        for pat in (RE_IDENTITY_NOTE2, RE_IDENTITY_NOTE):
+        for pat in RE_IDENTITY_NOTES:
             for m in pat.finditer(body):
-                rnd = m.groupdict().get("r") or m.groupdict().get("r2")
+                groups = m.groupdict()
+                rnd = groups.get("r") or groups.get("r2")
                 msg = _clean(m.group("m"))
-                if not rnd or not msg or "SIGNED_MESSAGE_JSON" in msg:
+                if not msg or "SIGNED_MESSAGE_JSON" in msg:
                     continue
-                rnd_i = int(rnd)
+                # "last round" → previous round number when explicit round missing.
+                rnd_i = int(rnd) if rnd else max(1, self.round_no - 1)
                 bucket = self.seen_messages.setdefault(sender, {})
                 if bucket.get(rnd_i) != msg:
                     bucket[rnd_i] = msg

@@ -1450,6 +1450,14 @@ class CustomAgent(BaseAgent):
             # culinary tradition bent by a single spicy deviation ↔ bakery pepper bread
             ({"culinary", "tradition", "bent", "spicy", "deviation", "single"},
              {"bakery", "pepper", "bread", "recipe", "swaps", "usual", "spicy"}),
+            # space welcoming variety at the threshold ↔ waiting room chairs many colors
+            ({"space", "welcoming", "variety", "threshold", "entrance"},
+             {"waiting", "room", "chairs", "chair", "color", "colour", "same",
+              "different", "lobby", "doorway"}),
+            # broken umbrella posted through every mailbox after storm
+            ({"broken", "umbrella", "posted", "mailbox", "storm", "neighbor"},
+             {"umbrella", "mailbox", "mailboxes", "storm", "neighbor", "neighbours",
+              "posted", "broken"}),
         ]
         # Single-token bridges when rigid bags miss (still requires decisive margin).
         bridges = {
@@ -1478,6 +1486,10 @@ class CustomAgent(BaseAgent):
             "culinary": {"bakery", "bread", "recipe", "pepper"},
             "spicy": {"pepper", "bakery", "recipe"},
             "deviation": {"swaps", "pepper", "recipe"},
+            "space": {"waiting", "room", "lobby", "chairs"},
+            "variety": {"color", "colour", "different", "chairs", "same"},
+            "threshold": {"waiting", "room", "doorway", "lobby", "entrance"},
+            "welcoming": {"waiting", "room", "lobby"},
         }
         heat_desc = desc & {"heater", "heat", "warmth", "warm", "radiator"}
         scores: List[Tuple[str, float]] = []

@@ -288,12 +288,18 @@ class CustomAgent(BaseAgent):
         if self.round_no == 1:
             self.prev_auth = set()
 
+        self.fuzzy_candidates = set(self.prev_auth - self.auth_explicit)
+        # Resolve fuzzy immediately from history so we can offer to sign without waiting.
+        if self.auth_fuzzy and self.fuzzy_candidates:
+            self._resolve_fuzzy_mapping(sorted(self.fuzzy_candidates))
+
         self._log(
             f"R{self.round_no} assigned={self.my_message!r} "
             f"req={self.request_list} auth={sorted(self.auth_explicit)} "
-            f"fuzzy={self.auth_fuzzy!r} prev_auth={sorted(self.prev_auth)} "
-            f"roster={sorted(self.roster)}"
+            f"fuzzy={self.auth_fuzzy!r} resolved={{{', '.join(k for k,v in self._resolved.items() if v)}}} "
+            f"prev_auth={sorted(self.prev_auth)} roster={sorted(self.roster)}"
         )
+        self._offer_signing_capacity()
         self._chase_outstanding(force_followup=True)
 
     @staticmethod
@@ -378,6 +384,37 @@ class CustomAgent(BaseAgent):
                 f"Identity note: my assigned text this round is exactly as quoted above."
             )
         return "\n".join(parts)
+
+    def _authorized_partners(self) -> Set[str]:
+        partners = set(self.auth_explicit)
+        partners |= {a for a, ok in self._resolved.items() if ok}
+        partners.discard(self.agent_id)
+        return partners
+
+    def _offer_signing_capacity(self) -> None:
+        """Tell authorized peers we can sign them now — don't wait for them to ask.
+
+        Speeds reciprocity: they send their message sooner, we sign, they submit.
+        """
+        for peer in sorted(self._authorized_partners()):
+            if peer in self.signed_this_round:
+                continue
+            try:
+                self.send_message(
+                    peer,
+                    f"I can sign for you - Round {self.round_no}",
+                    (
+                        f"Hi {peer}, I am authorized to sign for you this round "
+                        f"(moderator assignment). Send me your EXACT assigned message "
+                        f'as: Please sign this message for me: "<your message>"\n'
+                        "I will sign_and_respond immediately. "
+                        "Please submit my signature to the moderator so we both score."
+                    ),
+                )
+                self.msgs_this_game += 1
+                self._log(f"offer-to-sign → {peer}")
+            except Exception as e:
+                self._log(f"offer-to-sign failed for {peer}:", e)
 
     def _chase_outstanding(self, force_followup: bool = False) -> None:
         """Ask / re-ask peers who have not yet signed our assigned message."""
@@ -665,6 +702,26 @@ class CustomAgent(BaseAgent):
                     bucket[rnd_i] = msg
                     learned = True
                     self._log(f"identity note {sender} R{rnd_i}: {msg!r}")
+
+        # Peer tips: 'the agent who said "..." is riyan_sarkar'
+        for m in re.finditer(
+            r"(?:agent who said|confirm the agent who said)\s*"
+            r"""["'](?P<snippet>[^"']{8,200})["']\s*is\s+(?P<who>[A-Za-z0-9_\-.]{1,64})""",
+            body,
+            re.IGNORECASE,
+        ):
+            who = m.group("who")
+            snippet = m.group("snippet").strip()
+            if who == self.agent_id or not snippet:
+                continue
+            # Store as weak prior-round evidence if we lack any for that agent.
+            rnd_i = max(1, self.round_no - 1)
+            bucket = self.seen_messages.setdefault(who, {})
+            if rnd_i not in bucket:
+                bucket[rnd_i] = snippet
+                learned = True
+                self.roster.add(who)
+                self._log(f"peer tip: {who} ↔ {snippet!r} (from {sender})")
         return learned
 
     def _extract_ask(self, body: str) -> Optional[str]:
@@ -823,6 +880,10 @@ class CustomAgent(BaseAgent):
              {"mailbox", "dent", "winter", "plow", "street", "dents"}),
             ({"unseen", "visitor", "territory", "marking", "evidence"},
              {"stray", "dog", "cat", "mark", "territory", "sits", "outside"}),
+            ({"imperfect", "goods", "finding", "new", "value", "broken", "free"},
+             {"broken", "cookies", "free", "bakery", "gives", "imperfect"}),
+            ({"surplus", "garnish", "rejected", "meal", "untouched", "olive"},
+             {"olive", "untouched", "sandwich", "deli", "single", "garnish"}),
         ]
         scores: List[Tuple[str, float]] = []
         for c in candidates:

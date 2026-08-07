@@ -46,7 +46,11 @@ RE_SIGN_LIST = re.compile(
 
 FUZZY_MARK = "(from last round"
 RE_SIGNED_JSON = re.compile(r"SIGNED_MESSAGE_JSON:\s*(?P<j>\{.*)", re.DOTALL)
+RE_PRIOR_MESSAGE_JSON = re.compile(
+    r"PRIOR_MESSAGE_JSON:\s*(?P<j>\{.*?\})", re.DOTALL
+)
 
+# Structured ask extractors only — bare quoted-string fallback is attack surface.
 RE_ASK = [
     re.compile(r"---BEGIN MESSAGE---\s*(?P<m>.+?)\s*---END MESSAGE---", re.DOTALL),
     re.compile(
@@ -59,8 +63,8 @@ RE_ASK = [
         r"(?:please\s+)?sign(?:\s+this)?[^:\n]{0,40}:\s*(?P<m>.+?)\s*$",
         re.MULTILINE | re.IGNORECASE,
     ),
-    re.compile(r'["\u201c](?P<m>[^"\u201c\u201d]{5,400})["\u201d]'),
 ]
+RE_ASK_BARE_QUOTE = re.compile(r'["\u201c](?P<m>[^"\u201c\u201d]{5,400})["\u201d]')
 
 RE_IDENTITY_NOTES = [
     re.compile(
@@ -172,8 +176,12 @@ class CustomAgent(BaseAgent):
                 self.refusal_counts = {}
             if not hasattr(self, "deadbeat_counts"):
                 self.deadbeat_counts = {}
+            if not hasattr(self, "message_owners"):
+                self.message_owners = {}
             if not hasattr(self, "_batch_seq"):
                 self._batch_seq = 0
+            if not hasattr(self, "_sent_kinds"):
+                self._sent_kinds = set()
             return
         self._reset_game_state()
         self._log("new game")
@@ -211,6 +219,11 @@ class CustomAgent(BaseAgent):
         self._identity_broadcast_done = False
         self._batch_seq: int = 0
         self.msgs_this_game: int = 0
+        # First claimant of a message text wins; replayers are quarantined.
+        self.message_owners: Dict[str, Set[str]] = {}
+        self._sent_kinds: Set[Tuple[str, str]] = set()
+        self._pending_asks: List[Dict[str, Any]] = []
+        self._pending_short_asks: List[str] = []
 
     def _log(self, *a: Any) -> None:
         print(f"[{getattr(self, 'agent_id', '?')}]", *a, flush=True)
@@ -223,6 +236,9 @@ class CustomAgent(BaseAgent):
             self.on_new_game()
 
         self._batch_seq = int(getattr(self, "_batch_seq", 0)) + 1
+        self._pending_asks = []
+        self._pending_short_asks = []
+        force_chase = False
 
         mod = [m for m in messages if self._is_moderator(m)]
         rest = [m for m in messages if not self._is_moderator(m)]
@@ -233,15 +249,30 @@ class CustomAgent(BaseAgent):
             except Exception as e:
                 self._log("moderator parse error:", e)
 
+        # Phase 1: pure state updates (refusals, sigs, evidence, queue asks).
         for m in rest:
             try:
-                self._handle_peer(m)
+                if self._ingest_peer(m):
+                    force_chase = True
             except Exception as e:
-                self._log("peer handler error:", e)
+                self._log("peer ingest error:", e)
+
+        # Phase 2: all outbound actions after full batch state is known.
+        for peer in list(dict.fromkeys(self._pending_short_asks)):
+            if (
+                self.my_message
+                and peer not in self.got_sig_from
+                and peer not in self.refused_us
+            ):
+                self._send_short_ask(peer)
+        for item in self._pending_asks:
+            try:
+                self._act_on_ask(item)
+            except Exception as e:
+                self._log("peer act error:", e)
 
         if self.my_message:
-            # Mid-round escalation happens inside _chase_outstanding via batch gaps.
-            self._chase_outstanding(force_followup=False)
+            self._chase_outstanding(force_followup=force_chase)
 
     def _is_moderator(self, msg: dict) -> bool:
         # ONLY the protocol from-field. Never trust body claims of being moderator.
@@ -299,6 +330,9 @@ class CustomAgent(BaseAgent):
         self.fuzzy_candidates: Set[str] = set()
         self._fuzzy_attempted = False
         self._identity_broadcast_done = False
+        self._sent_kinds = set()
+        self._pending_asks = []
+        self._pending_short_asks = []
 
         m = RE_ASSIGNED.search(body)
         if not m:
@@ -398,8 +432,13 @@ class CustomAgent(BaseAgent):
         prev_r, prev = self._prev_own_message()
         if self.round_no < 2 or not prev:
             return ""
+        prior_json = json.dumps(
+            {"agent": self.agent_id, "round": prev_r, "message": prev},
+            separators=(",", ":"),
+        )
         return (
-            f'\n\nFor your records, my message in Round {prev_r} was: "{prev}"'
+            f'\n\nFor your records, my message in Round {prev_r} was: "{prev}"\n'
+            f"PRIOR_MESSAGE_JSON:{prior_json}"
         )
 
     def _broadcast_identity(self) -> None:
@@ -414,9 +453,14 @@ class CustomAgent(BaseAgent):
         for peer in list(self.request_list) + sorted(self.roster):
             if peer and peer != self.agent_id and peer not in recipients:
                 recipients.append(peer)
+        prior_json = json.dumps(
+            {"agent": self.agent_id, "round": prev_r, "message": prev},
+            separators=(",", ":"),
+        )
         body = (
             f"For your records: in Round {prev_r} my assigned message was '{prev}'. "
-            f"I am {self.agent_id}."
+            f"I am {self.agent_id}.\n"
+            f"PRIOR_MESSAGE_JSON:{prior_json}"
         )
         for peer in recipients:
             try:
@@ -590,24 +634,23 @@ class CustomAgent(BaseAgent):
             )
 
     # ------------------------------------------------------------------
-    # peers
+    # peers — ingest (phase 1) then act (phase 2)
     # ------------------------------------------------------------------
-    def _handle_peer(self, msg: dict) -> None:
+    def _ingest_peer(self, msg: dict) -> bool:
+        """Update state only. Returns True if a force-chase reminder fired."""
         sender = str(msg.get("from", "")).strip()
         body = msg.get("body", "") or ""
+        subject = msg.get("subject", "") or ""
         if not sender or sender == self.agent_id:
-            return
+            return False
 
         if sender.lower() in ("system_reminder",):
-            if self.my_message:
-                self._log("inactivity reminder → chase outstanding")
-                self._chase_outstanding(force_followup=True)
-            return
+            return bool(self.my_message)
 
         self.roster.add(sender)
-        learned = self._ingest_identity_notes(sender, body)
+        # Subject+body: identity wording sometimes only appears in the subject.
+        learned = self._ingest_identity_notes(sender, f"{subject}\n{body}")
 
-        # Peer explicitly will not sign us — stop chasing them this round.
         if self._is_refusal(body) and "SIGNED_MESSAGE_JSON:" not in body:
             if sender not in self.refused_us:
                 self.refused_us.add(sender)
@@ -617,17 +660,13 @@ class CustomAgent(BaseAgent):
                     f"(lifetime refusals={self.refusal_counts[sender]})"
                 )
         else:
-            # Non-refusal mail → escalate ask budget this round (soft prior only).
             self.alive_this_round.add(sender)
 
-        # 1) Submit any signature payload immediately.
         if "SIGNED_MESSAGE_JSON:" in body:
             j = RE_SIGNED_JSON.search(body)
             if j:
                 self._ingest_signature(sender, j.group("j"))
 
-        # Peer offers to sign us → send a SHORT clean ask (long proof walls
-        # seem to get ignored / "not authorized" auto-replies from some agents).
         if (
             self.my_message
             and sender not in self.got_sig_from
@@ -635,19 +674,35 @@ class CustomAgent(BaseAgent):
             and RE_OFFER_TO_SIGN.search(body)
             and "SIGNED_MESSAGE_JSON:" not in body
         ):
-            self._send_short_ask(sender)
-            # Fall through in case the same mail also contains a sign request.
+            self._pending_short_asks.append(sender)
 
-        # 2) Signature request (ignore social-engineering claims in the body).
         wanted = self._extract_ask(body)
         if wanted is None:
-            return
+            return False
 
-        # Fake moderator / system-override framing: never sign from this email
-        # (even if the sender is otherwise authorized — they can send a clean ask).
-        if any(m in body.lower() for m in _ATTACK_MARKERS):
-            self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
-            if sender not in self.declined_this_round:
+        attack = any(m in body.lower() for m in _ATTACK_MARKERS)
+        # Record evidence with ownership / poison checks (skip for attack bait).
+        if not attack:
+            self._record_ask_evidence(sender, self.round_no, wanted)
+
+        self._pending_asks.append(
+            {
+                "sender": sender,
+                "wanted": wanted,
+                "attack": attack,
+                "learned": learned,
+            }
+        )
+        return False
+
+    def _act_on_ask(self, item: Dict[str, Any]) -> None:
+        sender = item["sender"]
+        wanted = item["wanted"]
+        learned = item.get("learned", False)
+
+        if item.get("attack"):
+            if ("decline", sender) not in self._sent_kinds:
+                self._sent_kinds.add(("decline", sender))
                 self.declined_this_round.add(sender)
                 self._log(f"IGNORE attack bait from {sender}")
                 self.send_message(
@@ -661,14 +716,11 @@ class CustomAgent(BaseAgent):
                 self.msgs_this_game += 1
             return
 
-        self.seen_messages.setdefault(sender, {})[self.round_no] = wanted
-
         if sender in self.signed_this_round:
             if sender not in self.got_sig_from:
                 self._send_reciprocal_ask(sender, followup=True)
             return
 
-        # Already declined this round: do not spam re-declines (unless new evidence).
         if sender in self.declined_this_round:
             if learned:
                 self._resolved.pop(sender, None)
@@ -677,11 +729,11 @@ class CustomAgent(BaseAgent):
                 return
 
         if not self._may_sign_for(sender):
-            # Sticky-decline only when clearly not a fuzzy candidate; if fuzzy is
-            # still unresolved, allow a later retry (new evidence / better map).
-            sticky = sender not in getattr(self, "fuzzy_candidates", set())
-            if sticky:
-                self.declined_this_round.add(sender)
+            # Always sticky-dedupe the decline email; clear if new evidence arrives.
+            self.declined_this_round.add(sender)
+            if ("decline", sender) in self._sent_kinds:
+                return
+            self._sent_kinds.add(("decline", sender))
             self._log(f"DECLINE {sender} (moderator auth only)")
             self.send_message(
                 sender,
@@ -701,8 +753,9 @@ class CustomAgent(BaseAgent):
                 self._send_short_ask(sender)
             return
 
-        # Authorized → sign with JSON first, submit-nudge AFTER the JSON (same email).
-        # Keep reciprocal ask as a separate mail so the JSON stays easy to parse/submit.
+        if ("sign", sender) in self._sent_kinds:
+            return
+        self._sent_kinds.add(("sign", sender))
         self.signed_this_round.add(sender)
         self.declined_this_round.discard(sender)
         self._sign_with_submit_nudge(sender, wanted)
@@ -815,14 +868,59 @@ class CustomAgent(BaseAgent):
         except Exception as e:
             self._log(f"short-ask failed for {peer}:", e)
 
+    @staticmethod
+    def _norm_msg(text: str) -> str:
+        return (text or "").strip().lower()
+
+    def _is_our_message(self, text: str) -> bool:
+        key = self._norm_msg(text)
+        return key in {
+            self._norm_msg(m) for m in (getattr(self, "my_message_history", {}) or {}).values()
+        }
+
+    def _record_ask_evidence(self, agent: str, rnd_i: int, message: str) -> bool:
+        """Store ask text as evidence; quarantine replays of others'/our messages."""
+        msg = _clean(message)
+        if not msg:
+            return False
+        key = self._norm_msg(msg)
+        if self._is_our_message(msg):
+            self._log(f"POISON: {agent} R{rnd_i} replaying OUR message — not stored")
+            return False
+        owners = self.message_owners.setdefault(key, set())
+        if owners and agent not in owners:
+            self._log(
+                f"POISON/REPLAY: {agent} R{rnd_i} replays {sorted(owners)}'s "
+                f"message — quarantined"
+            )
+            return False
+        owners.add(agent)
+        bucket = self.seen_messages.setdefault(agent, {})
+        bucket[rnd_i] = msg
+        return True
+
     def _record_identity_claim(
         self, agent: str, rnd_i: int, msg: str, *, source: str
     ) -> bool:
-        """Fill gaps only — never overwrite ask evidence or an earlier claim."""
+        """Fill gaps only — never overwrite ask evidence or accept poisoned claims."""
+        msg = _clean(msg)
+        if not msg:
+            return False
+        if self._is_our_message(msg):
+            self._log(f"{source} ignored (OUR message) {agent} R{rnd_i}: {msg!r}")
+            return False
+        key = self._norm_msg(msg)
+        owners = self.message_owners.setdefault(key, set())
+        if owners and agent not in owners:
+            self._log(
+                f"{source} ignored (owned by {sorted(owners)}) {agent} R{rnd_i}: {msg!r}"
+            )
+            return False
         bucket = self.seen_messages.setdefault(agent, {})
         existing = bucket.get(rnd_i)
         if existing is None:
             bucket[rnd_i] = msg
+            owners.add(agent)
             self._log(f"{source} {agent} R{rnd_i}: {msg!r}")
             return True
         if existing != msg:
@@ -833,35 +931,49 @@ class CustomAgent(BaseAgent):
         return False
 
     def _ingest_identity_notes(self, sender: str, body: str) -> bool:
-        """Ingest peer-claimed prior texts. Never overwrite ask-derived evidence.
-
-        Peers lie (this match: raffi claimed michael's pharmacist line as his own).
-        Actual 'please sign this message for me' asks are ground truth and win.
-        """
+        """Ingest peer-claimed prior texts. Never overwrite ask-derived evidence."""
         learned = False
+        for m in RE_PRIOR_MESSAGE_JSON.finditer(body or ""):
+            try:
+                data = json.loads(m.group("j"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            agent = str(data.get("agent") or sender).strip()
+            try:
+                rnd_i = int(data.get("round"))
+            except (TypeError, ValueError):
+                rnd_i = max(1, self.round_no - 1)
+            msg = _clean(str(data.get("message") or ""))
+            if agent and msg and self._record_identity_claim(
+                agent, rnd_i, msg, source="PRIOR_MESSAGE_JSON"
+            ):
+                learned = True
+                if agent != self.agent_id:
+                    self.roster.add(agent)
+
         explicit: List[Tuple[int, str]] = []
         implicit: List[Tuple[int, str]] = []
         for pat in RE_IDENTITY_NOTES:
-            for m in pat.finditer(body):
+            for m in pat.finditer(body or ""):
                 groups = m.groupdict()
                 rnd = groups.get("r") or groups.get("r2")
                 msg = _clean(m.group("m"))
-                if not msg or "SIGNED_MESSAGE_JSON" in msg:
+                if not msg or "SIGNED_MESSAGE_JSON" in msg or "PRIOR_MESSAGE_JSON" in msg:
                     continue
                 rnd_i = int(rnd) if rnd else max(1, self.round_no - 1)
                 (explicit if rnd else implicit).append((rnd_i, msg))
-        # Prefer explicit "in Round N" claims over ambiguous "last round" fillers.
         for rnd_i, msg in explicit + implicit:
             if self._record_identity_claim(
                 sender, rnd_i, msg, source="identity note"
             ):
                 learned = True
 
-        # Peer tips: 'the agent who said "..." is riyan_sarkar'
         for m in re.finditer(
             r"(?:agent who said|confirm the agent who said)\s*"
             r"""["'](?P<snippet>[^"']{8,200})["']\s*is\s+(?P<who>[A-Za-z0-9_\-.]{1,64})""",
-            body,
+            body or "",
             re.IGNORECASE,
         ):
             who = m.group("who")
@@ -876,26 +988,45 @@ class CustomAgent(BaseAgent):
                 self.roster.add(who)
         return learned
 
+    def _extract_b64_message(self, body: str) -> Optional[str]:
+        m = re.search(r"MESSAGE_UTF8_BASE64:([A-Za-z0-9+/=]+)", body or "")
+        if not m:
+            return None
+        try:
+            decoded = base64.b64decode(m.group(1)).decode("utf-8")
+        except Exception:
+            return None
+        if 5 <= len(decoded) <= 400:
+            return decoded
+        return None
+
     def _extract_ask(self, body: str) -> Optional[str]:
-        # Prefer structured proof blocks peers may send (same format we use).
+        """Prefer structured asks; require quote/base64 agreement when both present."""
+        quoted: Optional[str] = None
         for pat in RE_ASK:
-            m = pat.search(body)
+            m = pat.search(body or "")
             if not m:
                 continue
             cand = _clean(m.group("m"))
             if 5 <= len(cand) <= 400 and "SIGNED_MESSAGE_JSON" not in cand:
                 if cand.upper().startswith("MESSAGE_UTF8_BASE64"):
                     continue
-                return cand
-        # Optional: accept base64 proof block if present and decodes cleanly.
-        m = re.search(r"MESSAGE_UTF8_BASE64:([A-Za-z0-9+/=]+)", body)
+                quoted = cand
+                break
+        b64ed = self._extract_b64_message(body or "")
+        if quoted and b64ed and quoted != b64ed:
+            self._log(f"PROOF MISMATCH — declining ask (quote≠b64)")
+            return None
+        if b64ed:
+            return b64ed
+        if quoted:
+            return quoted
+        # Bare-quote fallback only when nothing structured exists (last resort).
+        m = RE_ASK_BARE_QUOTE.search(body or "")
         if m:
-            try:
-                decoded = base64.b64decode(m.group(1)).decode("utf-8")
-                if 5 <= len(decoded) <= 400:
-                    return decoded
-            except Exception:
-                pass
+            cand = _clean(m.group("m"))
+            if 5 <= len(cand) <= 400 and "SIGNED_MESSAGE_JSON" not in cand:
+                return cand
         return None
 
     def _ingest_signature(self, sender: str, raw_json: str) -> None:
@@ -918,6 +1049,19 @@ class CustomAgent(BaseAgent):
         if not isinstance(sig, dict) or "signature" not in sig:
             return
 
+        signer = str(sig.get("signer") or "").strip()
+        if not signer:
+            self._log(f"ignoring signature with empty signer from {sender}")
+            return
+        if signer == self.agent_id:
+            self._log("ignoring self-signed payload")
+            return
+        if signer != sender:
+            self._log(
+                f"ignoring signature: signer={signer!r} != sender={sender!r}"
+            )
+            return
+
         if sig.get("signed_for") != self.agent_id:
             self._log(f"ignoring signature made out to {sig.get('signed_for')}")
             return
@@ -927,14 +1071,13 @@ class CustomAgent(BaseAgent):
             return
 
         key = (
-            sig.get("signer"),
+            signer,
             sig.get("signed_for"),
             sig.get("original_message"),
         )
         if key in self.submitted:
             return
         self.submitted.add(key)
-        signer = sig.get("signer") or sender
         self.got_sig_from.add(signer)
         self.deadbeat_counts.pop(signer, None)
         self.alive_this_round.add(signer)
@@ -972,8 +1115,17 @@ class CustomAgent(BaseAgent):
         if sender not in candidates:
             return False
 
+        # N fuzzy slots replace exactly those N prev-auth agents → all authorized.
+        if self.auth_fuzzy and len(self.auth_fuzzy) == len(candidates):
+            for c in candidates:
+                self._resolved[c] = True
+                self.declined_this_round.discard(c)
+            self._log(f"fuzzy bijection: all {candidates} authorized")
+            return True
+
         if len(self.auth_fuzzy) == 1 and len(candidates) == 1:
             self._resolved[sender] = True
+            self.declined_this_round.discard(sender)
             self._log(f"fuzzy sole-candidate: {sender}")
             return True
 
@@ -985,6 +1137,7 @@ class CustomAgent(BaseAgent):
             only = evidenced[0]
             for c in candidates:
                 self._resolved[c] = c == only
+            self.declined_this_round.discard(only)
             self._log(f"fuzzy sole-evidence: {only}")
             return bool(self._resolved.get(sender))
 
@@ -1068,7 +1221,28 @@ class CustomAgent(BaseAgent):
             # creativity halted by a difficult hue ↔ refuse to rehearse if orange
             ({"creativity", "halted", "difficult", "hue", "color", "presence"},
              {"singer", "rehearse", "orange", "refuses", "wears", "colour", "color"}),
+            # sentimental attachments outweighing utility ↔ keychain more trinkets than keys
+            ({"sentimental", "attachments", "outweighing", "utility", "keepsake"},
+             {"keychain", "trinkets", "keys", "holds", "more", "keepsakes", "souvenirs"}),
+            # messages time-stamped one day ahead by habit ↔ tomorrow's date on postcards
+            ({"messages", "time", "stamped", "timestamped", "ahead", "habit", "day"},
+             {"tomorrow", "date", "postcard", "postcards", "writes", "every"}),
+            # playthings lingering after everyone else has gone ↔ toy still moving after bell
+            ({"playthings", "lingering", "everyone", "gone", "after"},
+             {"toy", "dog", "wind", "circles", "classroom", "bell", "rings", "after"}),
         ]
+        # Single-token bridges when rigid bags miss (still requires decisive margin).
+        bridges = {
+            "sentimental": {"trinkets", "keepsakes", "souvenirs", "mementos", "keychain"},
+            "attachments": {"trinkets", "keepsakes", "keychain", "charms"},
+            "utility": {"keys", "useful", "practical", "tools"},
+            "playthings": {"toy", "toys", "doll", "wind"},
+            "lingering": {"circles", "remains", "stays", "after"},
+            "timestamped": {"date", "tomorrow", "postcard"},
+            "stamped": {"date", "tomorrow", "postcard"},
+            "anticipation": {"candle", "midnight", "almost", "before"},
+            "dimmed": {"out", "went", "extinguished"},
+        }
         scores: List[Tuple[str, float]] = []
         for c in candidates:
             msg = (self._prev_round_message(c) or "").lower()
@@ -1080,6 +1254,12 @@ class CustomAgent(BaseAgent):
             for dbag, mbag in bags:
                 if desc & dbag and words & mbag:
                     bonus += 2.0 + len(words & mbag)
+            for dword in desc:
+                linked = bridges.get(dword)
+                if linked:
+                    hit = words & linked
+                    if hit:
+                        bonus += 1.5 + 0.5 * len(hit)
             scores.append((c, overlap + bonus))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
@@ -1116,12 +1296,41 @@ class CustomAgent(BaseAgent):
         )
         return False
 
+    def _score_pick_fuzzy(
+        self, scores: Dict[str, float], *, source: str
+    ) -> Optional[str]:
+        """Pick when clearly ahead. Wrong sign is −1 and feeds opponent; need edge."""
+        if not scores:
+            return None
+        ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+        best_a, best_s = ranked[0]
+        second_s = ranked[1][1] if len(ranked) > 1 else -1.0
+        # 0-100 scale from LLM, or heuristic raw scores scaled loosely.
+        if best_s >= 55 and (best_s - second_s) >= 10:
+            self._log(
+                f"fuzzy {source} pick {best_a} ({best_s:.1f} vs {second_s:.1f})"
+            )
+            return best_a
+        self._log(
+            f"fuzzy {source} abstain best={best_a}:{best_s:.1f} "
+            f"second={second_s:.1f}"
+        )
+        return None
+
     def _resolve_fuzzy_mapping(self, candidates: List[str]) -> Dict[str, bool]:
         # If we already positively mapped everyone we need, reuse.
         if (
             self.auth_fuzzy
             and sum(1 for v in self._resolved.values() if v) >= len(self.auth_fuzzy)
         ):
+            return self._resolved
+
+        # Bijection already handled in _may_sign_for; keep as safety net.
+        if self.auth_fuzzy and len(self.auth_fuzzy) == len(candidates):
+            for c in candidates:
+                self._resolved[c] = True
+                self.declined_this_round.discard(c)
+            self._log(f"fuzzy bijection: all {candidates} authorized")
             return self._resolved
 
         lines = self._evidence_lines(candidates)
@@ -1131,64 +1340,74 @@ class CustomAgent(BaseAgent):
 
         self._log("fuzzy evidence:\n" + "\n".join(lines))
 
+        chosen: Set[str] = set()
         n = len(self.auth_fuzzy)
-        prompt = (
-            "You are resolving fuzzy agent identities in The Email Game.\n"
-            "Each DESCRIPTION paraphrases exactly one agent's PRIOR-round assigned "
-            "message using synonyms — lexical overlap may be near zero. Match MEANING.\n"
-            "CRITICAL: A wrong match costs -1. If unsure between two agents, return null.\n"
-            "Examples:\n"
-            "- 'mystery surrounding the origin of an unexpected gift' ↔ "
-            "'No one remembers who planted the pear tree by the playground.'\n"
-            "- 'announcements lingering long after their moment passed' ↔ "
-            "'A poster advertising a concert remained up a year after it was over.'\n"
-            "- 'precaution formalized by annual exchange' ↔ "
-            "'Neighbors swap house keys once each year, just in case.'\n"
-            "- 'persistent evidence of a rough season for home deliveries' ↔ "
-            "'Every mailbox on the street wears dents from last winter's plow.'\n\n"
-            f"There are {n} description(s). For each clear match, return the agent id "
-            "AND quote their prior message from Evidence that the description paraphrases.\n\n"
-            "Descriptions:\n"
-            + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
-            + "\n\nEvidence (agent id → prior messages):\n"
-            + "\n".join(lines)
-            + "\n\nJSON only: "
-            '{"matches":[{"description_index":1,"agent":"<id>",'
-            '"matched_prior_message":"<exact prior text from Evidence>"}]} '
-            "or {\"matches\":[]} if unsure."
-        )
-        data = self._ask_llm_json(prompt)
-        if (data is None or not (isinstance(data, dict) and (
-            data.get("matches") or data.get("agent") or data.get("agents")
-        ))) and len(self.auth_fuzzy) == 1:
-            # Second pass: still require a grounded quote — never coin-flip.
-            data = self._ask_llm_json(
-                "Which ONE agent id does this paraphrase describe?\n"
-                "Only answer if you can quote their prior message from Evidence that "
-                "matches the description's MEANING. If both are plausible, agent=null.\n"
+
+        if n == 1:
+            prompt = (
+                "Score how well each agent's PRIOR message matches this paraphrase "
+                "(meaning/synonyms; lexical overlap may be near zero).\n"
                 f"Description: {self.auth_fuzzy[0]}\n"
                 + "\n".join(lines)
-                + "\nJSON only: "
-                '{"agent":"<id>","matched_prior_message":"<exact prior text>"} '
-                'or {"agent":null}'
+                + "\n\nJSON only: "
+                '{"scores":{"<agent_id>":0-100,...},'
+                '"best":"<agent_id or null>",'
+                '"matched_prior_message":"<exact prior text or empty>"}'
             )
-
-        chosen: Set[str] = set()
-        if isinstance(data, dict):
-            for item in data.get("matches") or []:
-                if not isinstance(item, dict):
-                    continue
-                agent = item.get("agent")
-                quote = item.get("matched_prior_message") or item.get("prior") or ""
-                if agent and self._accept_fuzzy_pick(agent, candidates, quote):
-                    chosen.add(agent)
-            if not chosen and data.get("agent") in candidates:
+            data = self._ask_llm_json(prompt)
+            scores: Dict[str, float] = {}
+            if isinstance(data, dict):
+                raw = data.get("scores") or {}
+                if isinstance(raw, dict):
+                    for a, s in raw.items():
+                        if a in candidates:
+                            try:
+                                scores[a] = float(s)
+                            except (TypeError, ValueError):
+                                pass
+                best = data.get("best") or data.get("agent")
                 quote = data.get("matched_prior_message") or data.get("prior") or ""
-                if self._accept_fuzzy_pick(data["agent"], candidates, quote):
-                    chosen.add(data["agent"])
-            for a in data.get("agents") or []:
-                if a in candidates and self._accept_fuzzy_pick(a, candidates, ""):
-                    chosen.add(a)
+                if best in candidates and self._accept_fuzzy_pick(best, candidates, quote):
+                    chosen.add(best)
+                elif scores:
+                    pick = self._score_pick_fuzzy(scores, source="llm-score")
+                    if pick and self._accept_fuzzy_pick(
+                        pick, candidates, quote if best == pick else ""
+                    ):
+                        chosen.add(pick)
+                    elif pick and not quote:
+                        # Score margin strong enough; accept without quote.
+                        if scores.get(pick, 0) >= 70:
+                            chosen.add(pick)
+        else:
+            prompt = (
+                "Each DESCRIPTION paraphrases exactly one agent's PRIOR message. "
+                "Match MEANING. Wrong match costs -1.\n"
+                "Descriptions:\n"
+                + "\n".join(f"{i+1}. {a}" for i, a in enumerate(self.auth_fuzzy))
+                + "\n\nEvidence:\n"
+                + "\n".join(lines)
+                + "\n\nJSON only: "
+                '{"matches":[{"description_index":1,"agent":"<id>",'
+                '"matched_prior_message":"<exact prior text>","confidence":0-100}]}'
+            )
+            data = self._ask_llm_json(prompt)
+            if isinstance(data, dict):
+                for item in data.get("matches") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    agent = item.get("agent")
+                    quote = item.get("matched_prior_message") or ""
+                    try:
+                        conf = float(item.get("confidence", 80))
+                    except (TypeError, ValueError):
+                        conf = 80.0
+                    if (
+                        agent in candidates
+                        and conf >= 55
+                        and self._accept_fuzzy_pick(agent, candidates, quote)
+                    ):
+                        chosen.add(agent)
 
         if not chosen and len(self.auth_fuzzy) == 1:
             evidenced = [
@@ -1199,49 +1418,66 @@ class CustomAgent(BaseAgent):
                 chosen.add(evidenced[0])
                 self._log(f"fuzzy fallback sole-evidence: {evidenced[0]}")
             else:
-                pick = self._heuristic_fuzzy_pick(self.auth_fuzzy[0], candidates)
-                if pick:
-                    chosen.add(pick)
-                    self._log(f"fuzzy heuristic → {pick}")
+                # Heuristic scores → same threshold gate (scaled to ~0-100-ish).
+                raw = self._heuristic_fuzzy_scores(self.auth_fuzzy[0], candidates)
+                if raw:
+                    mx = max(s for _, s in raw) or 1.0
+                    scaled = {a: (s / mx) * 100.0 for a, s in raw}
+                    pick = self._score_pick_fuzzy(scaled, source="heuristic")
+                    if pick:
+                        chosen.add(pick)
+                        self._log(f"fuzzy heuristic → {pick}")
 
         if chosen:
             for c in candidates:
                 self._resolved[c] = c in chosen
             for c in chosen:
+                self.declined_this_round.discard(c)
                 self._log(f"fuzzy mapped -> {c}")
         else:
-            # Do NOT cache False for all candidates — allows retry on later asks.
             self._log(
-                f"fuzzy unresolved among {candidates}; declining this ask (no cache) "
-                "— abstain beats a wrong -1"
+                f"fuzzy unresolved among {candidates}; declining this ask (no cache)"
             )
         return self._resolved
 
     def _ask_llm_json(self, prompt: str) -> Optional[dict]:
-        try:
-            from openai import OpenAI
-        except Exception:
-            return None
-        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not api_key:
-            return None
-        base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
+        """Use the harness LLM client first (same key/gateway as --model)."""
+        client = None
         model = (
             getattr(getattr(self, "driver", None), "model", None)
             or os.getenv("OPENAI_MODEL")
             or "gpt-4.1-mini"
         )
-        try:
+        driver = getattr(self, "driver", None)
+        if driver is not None:
+            client = getattr(driver, "_openai_client", None)
+
+        if client is None:
+            try:
+                from openai import OpenAI
+            except Exception:
+                self._log("!! fuzzy LLM unavailable (no openai package)")
+                return None
+            api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+            if not api_key:
+                self._log(
+                    "!! fuzzy LLM unavailable — driver has no client and "
+                    "OPENAI_API_KEY unset; heuristic only"
+                )
+                return None
+            base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
             client = (
                 OpenAI(api_key=api_key, base_url=base_url)
                 if base_url
                 else OpenAI(api_key=api_key)
             )
+
+        try:
             out = (
                 client.chat.completions.create(
                     model=model,
                     temperature=0,
-                    max_tokens=80,
+                    max_tokens=160,
                     messages=[
                         {
                             "role": "system",
@@ -1254,9 +1490,15 @@ class CustomAgent(BaseAgent):
                 .message.content
                 or ""
             )
+            if driver is not None and hasattr(driver, "_track_usage"):
+                # Best-effort: usage tracking needs the response object; skip if unavailable.
+                pass
             text = out.strip().strip("`")
             if text.lower().startswith("json"):
                 text = text[4:].strip()
+            # Tolerate prose wrappers around JSON.
+            if "{" in text and "}" in text:
+                text = text[text.find("{") : text.rfind("}") + 1]
             return json.loads(text)
         except Exception as e:
             self._log("resolve failed, declining:", e)
